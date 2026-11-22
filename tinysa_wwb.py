@@ -25,6 +25,8 @@ import threading
 import time
 import uuid
 
+import numpy as np
+
 POINTS = 450                       # points par balayage
 PAS_MHZ = 0.025                    # pas de 25 kHz (minimum accepté par WWB)
 DEBUT_DEFAUT = "470"
@@ -236,9 +238,10 @@ def lire_canaux(texte):
     return res
 
 
-def dessiner_canaux(ax, xmin, xmax, surlignes=(), afficher=True):
-    """Repères des canaux TNT : trait à chaque début de canal, numéro en bas, canaux surlignés en rouge.
-    Renvoie les éléments dessinés (pour pouvoir les effacer)."""
+def dessiner_tnt(ax, ax_tnt, xmin, xmax, surlignes=(), afficher=True):
+    """Repères TNT façon Wireless Workbench : une bande de cases numérotées sous l'axe des fréquences,
+    des traits discrets dans le graphique, les canaux surlignés en rouge. Renvoie les éléments dessinés."""
+    from matplotlib.patches import Rectangle
     arts = []
     if not afficher:
         return arts
@@ -246,12 +249,15 @@ def dessiner_canaux(ax, xmin, xmax, surlignes=(), afficher=True):
         a, b = canal_tnt(n)
         if b < xmin or a > xmax:
             continue
-        if n in surlignes:
-            arts.append(ax.axvspan(max(a, xmin), min(b, xmax), color="tab:red", alpha=0.15, linewidth=0))
-        arts.append(ax.axvline(a, color="gray", alpha=0.3, linewidth=0.5))
+        surligne = n in surlignes
+        arts.append(ax_tnt.add_patch(Rectangle((a, 0.1), b - a, 0.8, facecolor="#7a2323" if surligne else "#242424",
+                                               edgecolor="#8a8a8a", linewidth=0.8)))
         centre = (max(a, xmin) + min(b, xmax)) / 2
-        arts.append(ax.text(centre, 0.01, str(n), transform=ax.get_xaxis_transform(),
-                            ha="center", va="bottom", fontsize=9, color="#444444"))
+        arts.append(ax_tnt.text(centre, 0.5, str(n), ha="center", va="center", fontsize=9,
+                                color="white", clip_on=True))
+        arts.append(ax.axvline(a, color="#5a5a5a", alpha=0.35, linewidth=0.5))
+        if surligne:
+            arts.append(ax.axvspan(max(a, xmin), min(b, xmax), color="#ff4d4d", alpha=0.13, linewidth=0))
     return arts
 
 
@@ -377,8 +383,10 @@ def ecrire_csv(donnees, chemin):
 
 # ---------- Sessions et scans ----------
 
-PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#17becf"]
+# couleurs vives, lisibles sur fond noir
+PALETTE = ["#4da3ff", "#ffb347", "#6ee06e", "#ff6b6b", "#c792ea", "#ffd54f", "#4dd0e1", "#f48fb1"]
 LISSAGE_K_MAX = 20           # curseur de lissage : k de 0 à 20  ->  1 + 2k points (1 à 41)
+LISSAGE_K_DEFAUT = 11        # 23 points (575 kHz)
 EXTENSION = ".tinysa"
 
 
@@ -387,7 +395,7 @@ def n_lissage(k):
 
 
 def nouvelle_session():
-    return {"version": 1, "nom": "Sans titre", "scans": []}
+    return {"version": 2, "nom": "Sans titre", "ref": None, "scans": []}
 
 
 def creer_scan(session, nom, donnees, **meta):
@@ -405,6 +413,7 @@ def creer_scan(session, nom, donnees, **meta):
         "date": datetime.datetime.now().isoformat(timespec="seconds"),
         "couleur": PALETTE[len(session["scans"]) % len(PALETTE)],
         "visible": True,
+        "gain": 0.0,
         "f": [round(x, 4) for x in freqs],
         "d": [round(donnees[x], 1) for x in freqs],
     }
@@ -425,7 +434,13 @@ def decrire_scan(scan):
     except (KeyError, ValueError):
         jour = ""
     extra = scan.get("resume", "")
-    return f"{plage}   {jour}" + (f"\n{extra}" if extra else "")
+    corr = []
+    g = scan.get("gain", 0.0)
+    if g:
+        corr.append(f"gain {g:+.1f} dB".replace(".", ","))
+    if scan.get("corr_f"):
+        corr.append("corrigé par bande")
+    return f"{plage}   {jour}" + (f"\n{extra}" if extra else "") + (f"\n{' + '.join(corr)}" if corr else "")
 
 
 def sauver_session(session, chemin):
@@ -442,7 +457,9 @@ def charger_session(chemin):
     if not isinstance(s, dict) or not isinstance(s.get("scans"), list):
         raise ValueError("Ce fichier n'est pas une session tinySA.")
     s.setdefault("nom", os.path.splitext(os.path.basename(chemin))[0])
+    s.setdefault("ref", None)
     for sc in s["scans"]:
+        sc.setdefault("gain", 0.0)
         sc.setdefault("id", uuid.uuid4().hex[:8])
         sc.setdefault("couleur", PALETTE[0])
         sc.setdefault("visible", True)
@@ -469,6 +486,56 @@ def courbe(freqs, vals, n):
             lis += lisser_valeurs(v, n)
             debut = i
     return xs, brut, lis
+
+
+def scan_effectif(scan):
+    """Fréquences et niveaux d'un scan avec son gain et sa correction par bande (ce qu'on voit et ce qu'on exporte)."""
+    f = np.asarray(scan["f"], dtype=float)
+    d = np.asarray(scan["d"], dtype=float) + float(scan.get("gain", 0.0))
+    if scan.get("corr_f"):
+        d = d + np.interp(f, scan["corr_f"], scan["corr_d"])      # hors plage : on garde les valeurs des bords
+    return f.tolist(), d.tolist()
+
+
+def donnees_effectives(scan):
+    f, d = scan_effectif(scan)
+    return dict(zip(f, d))
+
+
+def correction_par_bande(tiny, ref, largeur=4.0):
+    """Courbe de correction (dB) pour rapprocher 'tiny' de 'ref', fenêtre par fenêtre (4 MHz).
+    Sur chaque fenêtre : médiane de l'écart sur les points où il y a du signal ; les fenêtres sans signal
+    sont interpolées ; puis un léger lissage. Renvoie (fréquences, corrections, infos)."""
+    t = {round(f, 3): v for f, v in lisser(tiny).items()}
+    s = {round(f, 3): v for f, v in lisser(ref).items()}
+    comm = sorted(set(t) & set(s))
+    if len(comm) < 50:
+        raise ValueError("Pas assez de fréquences en commun (il faut au moins 50 points entre les deux scans).")
+    F = np.array(comm)
+    T = np.array([t[f] for f in comm])
+    S = np.array([s[f] for f in comm])
+    D = S - T
+    sig = (T > np.median(T) + 10) | (S > np.median(S) + 10)
+    nb = max(1, int(math.ceil((F[-1] - F[0]) / largeur)))
+    centres, valeurs, masques = [], [], []
+    for k in range(nb):
+        a = F[0] + k * largeur
+        m = (F >= a) & (F < a + largeur) if k < nb - 1 else (F >= a)
+        if not m.any():
+            continue
+        centres.append(float(F[m].mean()))
+        masques.append(m)
+        valeurs.append(float(np.median(D[m & sig])) if (m & sig).sum() >= 5 else None)
+    avec_signaux = sum(v is not None for v in valeurs)
+    if avec_signaux == 0:       # aucun signal : on cale le niveau typique de chaque fenêtre
+        valeurs = [float(np.median(D[m])) for m in masques]
+    ok = [i for i, v in enumerate(valeurs) if v is not None]
+    vals = np.interp(centres, [centres[i] for i in ok], [valeurs[i] for i in ok])
+    if len(vals) >= 3:
+        vals = np.convolve(np.pad(vals, 1, mode="edge"), np.ones(3) / 3, mode="valid")
+    infos = {"fenetres": len(centres), "avec_signaux": avec_signaux,
+             "min": float(vals.min()), "max": float(vals.max())}
+    return [round(c, 3) for c in centres], [round(float(v), 2) for v in vals], infos
 
 
 # ---------- Travail en arrière-plan ----------
@@ -576,6 +643,10 @@ def travail(p, msg, stop):
 
 # ---------- Fenêtre ----------
 
+FOND = "#101010"          # fond de la fenêtre graphique
+GRIS = "#bbbbbb"
+
+
 def main():
     try:
         import tkinter as tk
@@ -584,6 +655,10 @@ def main():
         sys.exit("Tkinter indisponible. Installe Python depuis python.org (Tkinter inclus).")
 
     cfg = charger_config()
+    if cfg.get("v") != 6:                       # anciens réglages d'affichage : on repart des nouveaux défauts
+        for cle in ("k", "brut", "off"):
+            cfg.pop(cle, None)
+        cfg["v"] = 6
 
     def c_str(cle, defaut):
         return str(cfg.get(cle, defaut))
@@ -598,15 +673,22 @@ def main():
     live = {"plan": [], "acc": {}, "now": ([], []), "courant": None, "dirty": True, "scan": False}
     vue = {"auto": True, "interne": False}
     seuil = {"y": None, "drag": False}
+    pan = {"actif": False, "x": 0, "xlim": (0, 1)}
     lignes = {}          # id du scan -> (ligne brute, ligne lissée)
-    cache = {}           # (id, n) -> courbe
+    cache = {}           # (id, lissage, gain, correction) -> courbe
+    pistes = []          # courbes affichées (pour la bulle au survol d'un pic)
+    etiquettes = {}      # id du scan -> étiquette de détails dans la liste
+    gain_sync = {"actif": False}
 
     root = tk.Tk()
     root.title("tinySA -> WWB")
-    root.geometry("1450x860")
+    try:
+        root.geometry(f"{root.winfo_screenwidth()}x{max(700, root.winfo_screenheight() - 90)}+0+0")
+    except Exception:
+        root.geometry("1450x860")
     root.minsize(1100, 680)
-    root.columnconfigure(1, weight=1)
-    root.rowconfigure(0, weight=1)
+    root.columnconfigure(0, weight=1)
+    root.rowconfigure(1, weight=1)
 
     # ---- variables
     var_deb = tk.StringVar(value=c_str("deb", DEBUT_DEFAUT))
@@ -620,10 +702,9 @@ def main():
     var_att = tk.StringVar(value=c_str("att", "auto"))
     var_lna = tk.BooleanVar(value=c_bool("lna", True))
     var_demo = tk.BooleanVar(value=False)
-    var_off = tk.StringVar(value=c_str("off", "0"))
     var_liss_ex = tk.BooleanVar(value=c_bool("liss_export", True))
-    var_k = tk.IntVar(value=int(cfg.get("k", 4)))            # 4 -> 9 points (225 kHz)
-    var_brut = tk.BooleanVar(value=c_bool("brut", True))
+    var_k = tk.IntVar(value=int(cfg.get("k", LISSAGE_K_DEFAUT)))
+    var_brut = tk.BooleanVar(value=c_bool("brut", False))
     var_tnt = tk.BooleanVar(value=c_bool("tnt", True))
     var_canaux = tk.StringVar(value=c_str("canaux", ""))
     var_seuil = tk.StringVar(value="")
@@ -631,79 +712,73 @@ def main():
     var_curseur = tk.StringVar(value="")
     var_liss_txt = tk.StringVar(value="")
     var_session = tk.StringVar(value="")
+    var_gain_txt = tk.StringVar(value="Aucun scan sélectionné")
 
-    # ---- colonne de gauche
-    gauche = ttk.Frame(root, padding=(10, 8, 6, 8))
-    gauche.grid(row=0, column=0, sticky="ns")
-    gauche.rowconfigure(5, weight=1)
+    # ---- barre du haut (3 lignes)
+    haut = ttk.Frame(root, padding=(10, 6, 10, 2))
+    haut.grid(row=0, column=0, sticky="we")
+    haut.columnconfigure(0, weight=1)
 
-    ligne_s = ttk.Frame(gauche)
-    ligne_s.grid(row=0, column=0, sticky="we")
-    ttk.Label(ligne_s, textvariable=var_session, font=("Helvetica", 14, "bold")).grid(
-        row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
-    btn_nouv = ttk.Button(ligne_s, text="Nouvelle")
-    btn_nouv.grid(row=1, column=0, padx=(0, 4))
-    btn_ouvrir = ttk.Button(ligne_s, text="Ouvrir...")
-    btn_ouvrir.grid(row=1, column=1, padx=(0, 4))
-    btn_sauver = ttk.Button(ligne_s, text="Enregistrer sous...")
-    btn_sauver.grid(row=1, column=2)
+    la = ttk.Frame(haut)
+    la.grid(row=0, column=0, sticky="we")
+    la.columnconfigure(5, weight=1)
+    ttk.Label(la, textvariable=var_session, font=("Helvetica", 14, "bold"), width=26).grid(
+        row=0, column=0, padx=(0, 10), sticky="w")
+    btn_nouv = ttk.Button(la, text="Nouvelle")
+    btn_nouv.grid(row=0, column=1, padx=(0, 4))
+    btn_ouvrir = ttk.Button(la, text="Ouvrir...")
+    btn_ouvrir.grid(row=0, column=2, padx=(0, 4))
+    btn_enreg = ttk.Button(la, text="Enregistrer")
+    btn_enreg.grid(row=0, column=3, padx=(0, 4))
+    btn_sauver = ttk.Button(la, text="Enregistrer sous...")
+    btn_sauver.grid(row=0, column=4, padx=(0, 14))
+    ttk.Label(la, textvariable=var_statut, width=40).grid(row=0, column=5, sticky="e", padx=(0, 8))
+    prog = ttk.Progressbar(la, mode="determinate", maximum=100, length=220)
+    prog.grid(row=0, column=6, sticky="e")
 
-    ttk.Separator(gauche).grid(row=1, column=0, sticky="we", pady=6)
+    lb = ttk.Frame(haut)
+    lb.grid(row=1, column=0, sticky="we", pady=(4, 0))
+    ttk.Label(lb, text="Plage (MHz) :").grid(row=0, column=0)
+    ttk.Entry(lb, textvariable=var_deb, width=6).grid(row=0, column=1, padx=(4, 2))
+    ttk.Label(lb, text="à").grid(row=0, column=2)
+    ttk.Entry(lb, textvariable=var_fin, width=6).grid(row=0, column=3, padx=(2, 14))
+    ttk.Label(lb, text="Passes :").grid(row=0, column=4)
+    ent_passes = ttk.Entry(lb, textvariable=var_passes, width=4)
+    ent_passes.grid(row=0, column=5, padx=(4, 4))
+    ttk.Checkbutton(lb, text="jusqu'à l'arrêt", variable=var_inf).grid(row=0, column=6, padx=(0, 14))
+    ttk.Checkbutton(lb, text="Max Hold", variable=var_max).grid(row=0, column=7, padx=(0, 14))
+    ttk.Label(lb, text="Nom du scan :").grid(row=0, column=8)
+    ttk.Entry(lb, textvariable=var_nom, width=20).grid(row=0, column=9, padx=(4, 14))
+    btn_go = ttk.Button(lb, text="Lancer le scan")
+    btn_go.grid(row=0, column=10, padx=(0, 4))
+    btn_view = ttk.Button(lb, text="Visualiser en direct")
+    btn_view.grid(row=0, column=11, padx=(0, 4))
+    btn_stop = ttk.Button(lb, text="Arrêter", state="disabled")
+    btn_stop.grid(row=0, column=12, padx=(0, 4))
+    btn_reset = ttk.Button(lb, text="Effacer le cumul", state="disabled")
+    btn_reset.grid(row=0, column=13)
 
-    reg = ttk.Frame(gauche)
-    reg.grid(row=2, column=0, sticky="we")
-    ttk.Label(reg, text="Plage (MHz) :").grid(row=0, column=0, sticky="w")
-    pl = ttk.Frame(reg)
-    pl.grid(row=0, column=1, columnspan=3, sticky="w")
-    ttk.Entry(pl, textvariable=var_deb, width=6).grid(row=0, column=0)
-    ttk.Label(pl, text=" à ").grid(row=0, column=1)
-    ttk.Entry(pl, textvariable=var_fin, width=6).grid(row=0, column=2)
-    ttk.Label(reg, text="Passes :").grid(row=1, column=0, sticky="w", pady=(4, 0))
-    pa = ttk.Frame(reg)
-    pa.grid(row=1, column=1, columnspan=3, sticky="w", pady=(4, 0))
-    ent_passes = ttk.Entry(pa, textvariable=var_passes, width=4)
-    ent_passes.grid(row=0, column=0)
-    chk_inf = ttk.Checkbutton(pa, text="jusqu'à l'arrêt", variable=var_inf)
-    chk_inf.grid(row=0, column=1, padx=(8, 0))
-    ttk.Checkbutton(reg, text="Max Hold (sinon : moyenne)", variable=var_max).grid(
-        row=2, column=0, columnspan=4, sticky="w", pady=(2, 0))
-    ttk.Label(reg, text="Nom du scan :").grid(row=3, column=0, sticky="w", pady=(6, 0))
-    ttk.Entry(reg, textvariable=var_nom, width=22).grid(row=3, column=1, columnspan=3, sticky="we", pady=(6, 0))
-    ttk.Label(reg, text="(ex : antenne cardio, omni...)", foreground="gray").grid(
-        row=4, column=1, columnspan=3, sticky="w")
+    lc = ttk.Frame(haut)
+    lc.grid(row=2, column=0, sticky="we", pady=(4, 2))
+    ttk.Checkbutton(lc, text="Appliquer ces réglages à l'appareil :", variable=var_appl).grid(row=0, column=0)
+    ttk.Label(lc, text="RBW (kHz)").grid(row=0, column=1, padx=(8, 2))
+    ttk.Combobox(lc, textvariable=var_rbw, values=["auto", "10", "30", "100", "300", "600"], width=6).grid(
+        row=0, column=2)
+    ttk.Label(lc, text="Atténuation (dB)").grid(row=0, column=3, padx=(8, 2))
+    ttk.Combobox(lc, textvariable=var_att, values=["auto", "0", "10", "20", "30"], width=6).grid(row=0, column=4)
+    ttk.Checkbutton(lc, text="LNA (désactive l'atténuation)", variable=var_lna).grid(row=0, column=5, padx=(10, 0))
+    ttk.Checkbutton(lc, text="Mode démo (sans appareil)", variable=var_demo).grid(row=0, column=6, padx=(16, 0))
 
-    app = ttk.Frame(gauche)
-    app.grid(row=3, column=0, sticky="we", pady=(6, 0))
-    ttk.Checkbutton(app, text="Appliquer ces réglages à l'appareil", variable=var_appl).grid(
-        row=0, column=0, columnspan=4, sticky="w")
-    ttk.Label(app, text="RBW (kHz)").grid(row=1, column=0, sticky="w", padx=(18, 0))
-    ttk.Combobox(app, textvariable=var_rbw, values=["auto", "10", "30", "100", "300", "600"], width=6).grid(
-        row=1, column=1, padx=(4, 10))
-    ttk.Label(app, text="Atténuation (dB)").grid(row=1, column=2)
-    ttk.Combobox(app, textvariable=var_att, values=["auto", "0", "10", "20", "30"], width=6).grid(
-        row=1, column=3, padx=(4, 0))
-    ttk.Checkbutton(app, text="LNA (désactive l'atténuation)", variable=var_lna).grid(
-        row=2, column=0, columnspan=4, sticky="w", padx=(18, 0))
-    ttk.Checkbutton(app, text="Mode démo (sans appareil)", variable=var_demo).grid(
-        row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
+    # ---- corps : Scan data à gauche, graphique pleine largeur à droite
+    corps = ttk.Frame(root)
+    corps.grid(row=1, column=0, sticky="nsew")
+    corps.columnconfigure(1, weight=1)
+    corps.rowconfigure(0, weight=1)
 
-    barre = ttk.Frame(gauche)
-    barre.grid(row=4, column=0, sticky="we", pady=8)
-    btn_go = ttk.Button(barre, text="Lancer le scan")
-    btn_go.grid(row=0, column=0, padx=(0, 4))
-    btn_view = ttk.Button(barre, text="Visualiser en direct")
-    btn_view.grid(row=0, column=1, padx=(0, 4))
-    btn_stop = ttk.Button(barre, text="Arrêter", state="disabled")
-    btn_stop.grid(row=0, column=2)
-    btn_reset = ttk.Button(barre, text="Effacer le cumul", state="disabled")
-    btn_reset.grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
-
-    # ---- Scan data
-    sd = ttk.LabelFrame(gauche, text="Scan data", padding=6)
-    sd.grid(row=5, column=0, sticky="nsew")
+    sd = ttk.LabelFrame(corps, text="Scan data", padding=6)
+    sd.grid(row=0, column=0, sticky="ns", padx=(10, 4), pady=4)
     sd.rowconfigure(0, weight=1)
-    sd.columnconfigure(0, weight=1)
-    zone = tk.Canvas(sd, width=330, height=230, highlightthickness=0)
+    zone = tk.Canvas(sd, width=300, height=300, highlightthickness=0)
     zone.grid(row=0, column=0, sticky="nsew")
     asc = ttk.Scrollbar(sd, orient="vertical", command=zone.yview)
     asc.grid(row=0, column=1, sticky="ns")
@@ -714,6 +789,7 @@ def main():
 
     act = ttk.Frame(sd)
     act.grid(row=1, column=0, columnspan=2, sticky="we", pady=(6, 0))
+    act.columnconfigure((0, 1, 2), weight=1)
     btn_export = ttk.Button(act, text="Exporter le scan sélectionné (CSV WWB)...")
     btn_export.grid(row=0, column=0, columnspan=3, sticky="we")
     btn_ren = ttk.Button(act, text="Renommer")
@@ -722,94 +798,103 @@ def main():
     btn_sup.grid(row=1, column=1, pady=(4, 0), sticky="we")
     btn_imp = ttk.Button(act, text="Importer...")
     btn_imp.grid(row=1, column=2, pady=(4, 0), sticky="we")
-    btn_cal = ttk.Button(act, text="Calibrer sur un scan de référence")
-    btn_cal.grid(row=2, column=0, columnspan=3, sticky="we", pady=(4, 0))
-    ex = ttk.Frame(act)
-    ex.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
-    ttk.Label(ex, text="Décalage à l'export (dB) :").grid(row=0, column=0)
-    ttk.Entry(ex, textvariable=var_off, width=6).grid(row=0, column=1, padx=(4, 0))
     ttk.Checkbutton(act, text="Appliquer le lissage du fader à l'export", variable=var_liss_ex).grid(
-        row=4, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
-    # ---- partie droite : afficheur large
-    droite = ttk.Frame(root, padding=(4, 8, 10, 8))
-    droite.grid(row=0, column=1, sticky="nsew")
-    droite.columnconfigure(0, weight=1)
-    droite.rowconfigure(0, weight=1)
+    gf = ttk.LabelFrame(sd, text="Gain du scan sélectionné", padding=6)
+    gf.grid(row=2, column=0, columnspan=2, sticky="we", pady=(8, 0))
+    gf.columnconfigure(0, weight=1)
+    ttk.Label(gf, textvariable=var_gain_txt, font=("Helvetica", 11, "bold")).grid(row=0, column=0, columnspan=3, sticky="w")
+    curseur_gain = ttk.Scale(gf, from_=-40, to=40, orient="horizontal")
+    curseur_gain.grid(row=1, column=0, columnspan=3, sticky="we", pady=(4, 4))
+    btn_auto = ttk.Button(gf, text="Auto")
+    btn_auto.grid(row=2, column=0, sticky="we", padx=(0, 3))
+    btn_bande = ttk.Button(gf, text="Auto par bande")
+    btn_bande.grid(row=2, column=1, sticky="we", padx=(0, 3))
+    btn_rz = ttk.Button(gf, text="Réinit.")
+    btn_rz.grid(row=2, column=2, sticky="we")
+    ttk.Label(gf, text="Auto cale le scan sur celui coché « Réf. ».", foreground="gray").grid(
+        row=3, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
-    graph_frame = ttk.Frame(droite)
-    graph_frame.grid(row=0, column=0, sticky="nsew")
+    graph_frame = ttk.Frame(corps)
+    graph_frame.grid(row=0, column=1, sticky="nsew", pady=4, padx=(0, 10))
     graph_frame.columnconfigure(0, weight=1)
     graph_frame.rowconfigure(0, weight=1)
 
     graphe = None
-    toolbar = None
     try:
         from matplotlib.figure import Figure
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-        fig = Figure(figsize=(11, 6), dpi=100)
-        ax = fig.add_subplot(111)
-        ax.set_xlabel("Fréquence (MHz)", fontsize=11)
-        ax.set_ylabel("Niveau (dBm)", fontsize=11)
-        ax.set_title("En attente d'un scan", fontsize=12)
-        ax.grid(True, alpha=0.3)
+        from matplotlib.ticker import FuncFormatter
+        fig = Figure(figsize=(12, 6), dpi=100, facecolor=FOND)
+        gs = fig.add_gridspec(2, 1, height_ratios=[24, 1.5], hspace=0.16,
+                              left=0.062, right=0.992, top=0.955, bottom=0.03)
+        ax = fig.add_subplot(gs[0])
+        ax_tnt = fig.add_subplot(gs[1], sharex=ax)
+        ax.set_facecolor("black")
+        ax_tnt.set_facecolor(FOND)
+        for a in (ax, ax_tnt):
+            for sp in a.spines.values():
+                sp.set_color("#888888")
+        ax.tick_params(colors=GRIS, labelsize=10)
+        ax.grid(True, color="#3a3a3a", linewidth=0.6)
+        ax.set_ylabel("Amplitude [dBm]", color=GRIS, fontsize=11)
+        ax.xaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:.3f}".replace(".", ",") + " MHz"))
+        ax_tnt.set_yticks([])
+        ax_tnt.tick_params(labelbottom=False, bottom=False)
+        ax_tnt.set_ylim(0, 1)
+        ax_tnt.set_ylabel("TV", rotation=0, color=GRIS, fontsize=10, labelpad=12, va="center")
+        ax.set_title("En attente d'un scan", color="#dddddd", fontsize=12)
         ax.set_xlim(float(DEBUT_DEFAUT), float(FIN_DEFAUT))
-        ax.set_ylim(-120, -40)
+        ax.set_ylim(-120, -20)
         canvas = FigureCanvasTkAgg(fig, master=graph_frame)
         canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
-        try:
-            from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
-            tb_frame = ttk.Frame(graph_frame)
-            tb_frame.grid(row=1, column=0, sticky="we")
-            toolbar = NavigationToolbar2Tk(canvas, tb_frame, pack_toolbar=False)
-            toolbar.pack(side="left")
-            toolbar.update()
-        except Exception:
-            toolbar = None
-        ligne_live_raw, = ax.plot([], [], color="black", alpha=0.3, linewidth=0.7)
-        ligne_live, = ax.plot([], [], color="black", linewidth=1.8, label="Scan en cours")
-        ligne_now, = ax.plot([], [], color="tab:orange", alpha=0.6, linewidth=0.7)
-        ligne_seuil = ax.axhline(-100, color="red", linewidth=1.2, visible=False)
-        txt_seuil = ax.text(0.01, 0.0, "", transform=ax.get_yaxis_transform(), color="red",
+        ligne_live_raw, = ax.plot([], [], color="white", alpha=0.3, linewidth=0.7)
+        ligne_live, = ax.plot([], [], color="white", linewidth=1.8, label="Scan en cours")
+        ligne_now, = ax.plot([], [], color="#ff9f40", alpha=0.7, linewidth=0.7)
+        ligne_seuil = ax.axhline(-100, color="#ff4d4d", linewidth=1.2, visible=False)
+        txt_seuil = ax.text(0.01, 0.0, "", transform=ax.get_yaxis_transform(), color="#ff4d4d",
                             fontsize=9, va="bottom", visible=False)
-        deco = []        # repères TNT + marqueur de tranche (effacés et redessinés)
-        fig.subplots_adjust(left=0.07, right=0.985, top=0.93, bottom=0.09)
+        marque_pic, = ax.plot([], [], "o", markersize=8, markerfacecolor="none",
+                              markeredgecolor="white", markeredgewidth=1.5, visible=False)
+        bulle = ax.annotate("", xy=(0, 0), xytext=(14, 14), textcoords="offset points", color="white",
+                            fontsize=10, annotation_clip=False, visible=False, zorder=10,
+                            bbox=dict(boxstyle="round,pad=0.4", facecolor="#1e1e1e", edgecolor="#9a9a9a"))
+        deco = []        # repères TNT, marqueur de tranche, remplissages (effacés et redessinés)
         graphe = True
     except Exception as err:
         ttk.Label(graph_frame, text=f"Visualisation indisponible ({err}).\nInstalle matplotlib :  pip3 install matplotlib").grid()
 
-    ctrl = ttk.Frame(droite)
-    ctrl.grid(row=1, column=0, sticky="we", pady=(6, 0))
-    ctrl.columnconfigure(1, weight=1)
-    ttk.Label(ctrl, text="Lissage :", font=("Helvetica", 12, "bold")).grid(row=0, column=0, padx=(0, 8))
-    curseur = ttk.Scale(ctrl, from_=0, to=LISSAGE_K_MAX, orient="horizontal")
+    # ---- barre du bas : lissage, options, journal
+    bas = ttk.Frame(root, padding=(10, 2, 10, 6))
+    bas.grid(row=2, column=0, sticky="we")
+    bas.columnconfigure(1, weight=1)
+    ttk.Label(bas, text="Lissage :", font=("Helvetica", 12, "bold")).grid(row=0, column=0, padx=(0, 8))
+    curseur = ttk.Scale(bas, from_=0, to=LISSAGE_K_MAX, orient="horizontal")
     curseur.set(var_k.get())
     curseur.grid(row=0, column=1, sticky="we")
-    ttk.Label(ctrl, textvariable=var_liss_txt, width=24).grid(row=0, column=2, padx=(8, 0))
+    ttk.Label(bas, textvariable=var_liss_txt, width=22).grid(row=0, column=2, padx=(8, 0))
 
-    opt = ttk.Frame(droite)
-    opt.grid(row=2, column=0, sticky="we", pady=(4, 0))
+    opt = ttk.Frame(bas)
+    opt.grid(row=1, column=0, columnspan=3, sticky="we", pady=(4, 0))
     ttk.Checkbutton(opt, text="Courbe brute en pâle", variable=var_brut).grid(row=0, column=0, padx=(0, 12))
     ttk.Checkbutton(opt, text="Canaux TNT", variable=var_tnt).grid(row=0, column=1, padx=(0, 4))
     ttk.Label(opt, text="surligner :").grid(row=0, column=2)
     ttk.Entry(opt, textvariable=var_canaux, width=14).grid(row=0, column=3, padx=(4, 12))
     ttk.Label(opt, text="Seuil (dBm) :").grid(row=0, column=4)
     ttk.Entry(opt, textvariable=var_seuil, width=6).grid(row=0, column=5, padx=(4, 12))
+    btn_zm = ttk.Button(opt, text="−", width=3)
+    btn_zm.grid(row=0, column=6, padx=(0, 2))
+    btn_zp = ttk.Button(opt, text="+", width=3)
+    btn_zp.grid(row=0, column=7, padx=(0, 6))
     btn_vue = ttk.Button(opt, text="Vue complète")
-    btn_vue.grid(row=0, column=6, padx=(0, 12))
+    btn_vue.grid(row=0, column=8, padx=(0, 12))
     btn_img = ttk.Button(opt, text="Enregistrer l'image...")
-    btn_img.grid(row=0, column=7)
+    btn_img.grid(row=0, column=9, padx=(0, 12))
+    ttk.Label(opt, textvariable=var_curseur, width=44).grid(row=0, column=10, sticky="e")
 
-    etat_l = ttk.Frame(droite)
-    etat_l.grid(row=3, column=0, sticky="we", pady=(6, 0))
-    etat_l.columnconfigure(1, weight=1)
-    ttk.Label(etat_l, textvariable=var_statut, width=44).grid(row=0, column=0, sticky="w")
-    prog = ttk.Progressbar(etat_l, mode="determinate", maximum=100)
-    prog.grid(row=0, column=1, sticky="we", padx=8)
-    ttk.Label(etat_l, textvariable=var_curseur, width=40).grid(row=0, column=2, sticky="e")
-
-    log = tk.Text(droite, height=5, state="disabled")
-    log.grid(row=4, column=0, sticky="we", pady=(6, 0))
+    log = tk.Text(bas, height=3, state="disabled")
+    log.grid(row=2, column=0, columnspan=3, sticky="we", pady=(6, 0))
 
     # ---- utilitaires
     def ecrire(texte):
@@ -819,20 +904,13 @@ def main():
         log.config(state="disabled")
 
     def maj_titre():
-        marque = " *" if sess["modifie"] and not sess["chemin"] else ""
+        marque = " *" if sess["modifie"] else ""
         nom = sess["s"]["nom"]
-        var_session.set(f"Session : {nom}{marque}")
+        var_session.set(f"{nom}{marque}")
         root.title(f"tinySA -> WWB  -  {nom}{marque}")
 
-    def enregistrer_auto():
-        """Enregistre la session si elle a déjà un fichier. Sinon : rien (elle reste en mémoire)."""
+    def marquer_modifie():
         sess["modifie"] = True
-        if sess["chemin"]:
-            try:
-                sauver_session(sess["s"], sess["chemin"])
-                sess["modifie"] = False
-            except Exception as e:
-                ecrire(f"ERREUR d'enregistrement de la session : {e}")
         maj_titre()
 
     def sauver_sous():
@@ -847,25 +925,54 @@ def main():
         )
         if not chemin:
             return False
-        sess["chemin"] = chemin
         sess["s"]["nom"] = os.path.splitext(os.path.basename(chemin))[0]
-        cfg["dossier"] = os.path.dirname(chemin)
-        cfg["session"] = chemin
         try:
             sauver_session(sess["s"], chemin)
-            sess["modifie"] = False
-            ecrire(f"Session enregistrée : {chemin}")
         except Exception as e:
             ecrire(f"ERREUR d'enregistrement : {e}")
             return False
+        sess["chemin"] = chemin
+        sess["modifie"] = False
+        cfg["dossier"] = os.path.dirname(chemin)
+        cfg["session"] = chemin
+        ecrire(f"Session enregistrée : {chemin}")
         maj_titre()
         return True
 
-    def demander_confirmation_perte():
-        if sess["s"]["scans"] and sess["modifie"] and not sess["chemin"]:
-            return messagebox.askyesno("Session non enregistrée",
-                                       "Cette session n'est pas enregistrée. La quitter quand même ?")
+    def sauver():
+        if not sess["chemin"]:
+            return sauver_sous()
+        try:
+            sauver_session(sess["s"], sess["chemin"])
+        except Exception as e:
+            ecrire(f"ERREUR d'enregistrement : {e}")
+            return False
+        sess["modifie"] = False
+        ecrire(f"Session enregistrée : {sess['chemin']}")
+        maj_titre()
         return True
+
+    def confirmer_perte():
+        """True si on peut quitter la session en cours (enregistrée, ou abandon voulu)."""
+        if not (sess["s"]["scans"] and sess["modifie"]):
+            return True
+        rep = messagebox.askyesnocancel("Session non enregistrée",
+                                        f"Enregistrer la session « {sess['s']['nom']} » avant de continuer ?")
+        if rep is None:
+            return False
+        return sauver() if rep else True
+
+    def scan_selectionne():
+        for sc in sess["s"]["scans"]:
+            if sc["id"] == sess["selection"]:
+                return sc
+        return None
+
+    def scan_ref():
+        for sc in sess["s"]["scans"]:
+            if sc["id"] == sess["s"].get("ref"):
+                return sc
+        return None
 
     def installer_session(s, chemin):
         for ident in list(lignes):
@@ -880,16 +987,18 @@ def main():
         live["acc"].clear()
         live["dirty"] = True
         rebuild_liste()
+        maj_gain_ui()
         maj_titre()
 
     def nouvelle():
-        if not demander_confirmation_perte():
+        if not confirmer_perte():
             return
         installer_session(nouvelle_session(), None)
+        sess["chemin"] = None
         ecrire("Nouvelle session.")
 
     def ouvrir():
-        if not demander_confirmation_perte():
+        if not confirmer_perte():
             return
         chemin = filedialog.askopenfilename(
             title="Ouvrir une session",
@@ -909,21 +1018,21 @@ def main():
         ecrire(f"Session ouverte : {chemin}  ({len(s['scans'])} scan(s))")
 
     # ---- liste des scans
-    def scan_selectionne():
-        for sc in sess["s"]["scans"]:
-            if sc["id"] == sess["selection"]:
-                return sc
-        return None
-
     def selectionner(ident):
         sess["selection"] = ident
         rebuild_liste()
+        maj_gain_ui()
 
     def basculer(sc, var):
         sc["visible"] = var.get()
         live["dirty"] = True
         vue["auto"] = True
-        enregistrer_auto()
+        marquer_modifie()
+
+    def definir_ref(sc, var):
+        sess["s"]["ref"] = sc["id"] if var.get() else None
+        marquer_modifie()
+        rebuild_liste()
 
     def choisir_couleur(sc):
         res = colorchooser.askcolor(color=sc["couleur"], title=f"Couleur de « {sc['nom']} »")
@@ -931,11 +1040,12 @@ def main():
             sc["couleur"] = res[1]
             live["dirty"] = True
             rebuild_liste()
-            enregistrer_auto()
+            marquer_modifie()
 
     def rebuild_liste():
         for w in liste.winfo_children():
             w.destroy()
+        etiquettes.clear()
         if not sess["s"]["scans"]:
             ttk.Label(liste, text="Aucun scan. Lance un scan ou importe un fichier.",
                       foreground="gray").grid(row=0, column=0, padx=4, pady=8)
@@ -956,6 +1066,10 @@ def main():
             det = tk.Label(ligne, text=decrire_scan(sc), bg=fond, anchor="w", justify="left",
                            font=("Helvetica", 9), fg="#444444")
             det.grid(row=1, column=2, sticky="we")
+            etiquettes[sc["id"]] = det
+            var_ref = tk.BooleanVar(value=sess["s"].get("ref") == sc["id"])
+            ttk.Checkbutton(ligne, text="Réf.", variable=var_ref,
+                            command=lambda s=sc, v=var_ref: definir_ref(s, v)).grid(row=0, column=3, rowspan=2, padx=(6, 0))
             ligne.columnconfigure(2, weight=1)
             for w in (ligne, nom, det):
                 w.bind("<Button-1>", lambda e, ident=sc["id"]: selectionner(ident))
@@ -970,7 +1084,8 @@ def main():
             sc["nom"] = nouveau.strip()
             live["dirty"] = True
             rebuild_liste()
-            enregistrer_auto()
+            maj_gain_ui()
+            marquer_modifie()
 
     def supprimer():
         sc = scan_selectionne()
@@ -980,10 +1095,13 @@ def main():
         if not messagebox.askyesno("Supprimer", f"Supprimer le scan « {sc['nom']} » de la session ?"):
             return
         sess["s"]["scans"].remove(sc)
+        if sess["s"].get("ref") == sc["id"]:
+            sess["s"]["ref"] = None
         sess["selection"] = sess["s"]["scans"][-1]["id"] if sess["s"]["scans"] else None
         live["dirty"] = True
         rebuild_liste()
-        enregistrer_auto()
+        maj_gain_ui()
+        marquer_modifie()
         ecrire(f"Scan « {sc['nom']} » supprimé.")
 
     def importer():
@@ -1006,49 +1124,138 @@ def main():
         vue["auto"] = True
         live["dirty"] = True
         rebuild_liste()
-        enregistrer_auto()
+        maj_gain_ui()
+        marquer_modifie()
         ecrire(f"Scan importé : {sc['nom']}  ({len(donnees)} points)")
 
-    def calibrer():
+    # ---- gain du scan sélectionné
+    def maj_gain_ui():
         sc = scan_selectionne()
-        autres = [s for s in sess["s"]["scans"] if s.get("visible") and s is not sc]
-        if not sc or len(autres) != 1:
-            ecrire("Calibration : sélectionne le scan tinySA (clic sur son nom) et coche en plus UN SEUL "
-                   "scan de référence (le Shure), en décochant les autres.")
-            return
-        ref = autres[0]
+        gain_sync["actif"] = True
         try:
-            r = comparer(scan_donnees(sc), scan_donnees(ref))
-        except Exception as e:
-            ecrire(f"Calibration impossible : {e}")
-            return
-        ecrire(f"Calibration : « {ref['nom']} » (référence) contre « {sc['nom']} », "
-               f"{r['plage'][0]:g} à {r['plage'][1]:g} MHz, {r['n']} points communs.")
-        ecrire(f"  Plancher de bruit : référence {r['plancher_shure']:.1f} dBm, tinySA {r['plancher_tiny']:.1f} dBm "
-               "(il diffère toujours un peu : RBW et détecteur ne sont pas les mêmes).")
-        if r["off_signal"] is not None:
-            ecrire(f"  Écart sur les signaux ({r['n_signal']} pts) : {r['off_signal']:+.1f} dB   <- proposé")
-        ecrire(f"  Écart sur tout le scan : {r['off_tout']:+.1f} dB")
-        if r["off_signal"] is not None and abs(r["off_signal"] - r["off_tout"]) > 3:
-            ecrire("  Attention : ces deux écarts diffèrent de plus de 3 dB. Regarde les deux courbes superposées "
-                   "avant de te fier à un chiffre.")
-        ecrire("  Par sous-bande : " + " ; ".join(f"{a:g}-{b:g} : {d:+.1f}" for a, b, d in r["bandes"]))
-        ecrire("  Valable seulement si les deux scans ont été pris au même endroit, avec la même antenne.")
-        if messagebox.askyesno("Calibration",
-                               f"Écart mesuré : {r['offset']:+.1f} dB (référence - tinySA).\n"
-                               "Mettre cette valeur dans « Décalage à l'export » ?"):
-            var_off.set(f"{r['offset']:.1f}")
-            ecrire(f"Décalage à l'export réglé sur {r['offset']:+.1f} dB.")
+            if sc:
+                curseur_gain.set(max(-40, min(40, sc.get("gain", 0.0))))
+                var_gain_txt.set(texte_gain(sc))
+            else:
+                curseur_gain.set(0)
+                var_gain_txt.set("Aucun scan sélectionné")
+        finally:
+            gain_sync["actif"] = False
 
+    def texte_gain(sc):
+        t = f"{sc['nom']} : {sc.get('gain', 0.0):+.1f} dB".replace(".", ",")
+        if sc.get("corr_f"):
+            t += " + correction par bande"
+        return t
+
+    def apres_changement_gain(sc):
+        sc["corr_ver"] = sc.get("corr_ver", 0)
+        var_gain_txt.set(texte_gain(sc))
+        det = etiquettes.get(sc["id"])
+        if det is not None:
+            det.config(text=decrire_scan(sc))
+        live["dirty"] = True
+        marquer_modifie()
+
+    def sur_gain(valeur):
+        if gain_sync["actif"]:
+            return
+        sc = scan_selectionne()
+        if not sc:
+            return
+        g = round(float(valeur) * 2) / 2
+        if g != sc.get("gain", 0.0):
+            sc["gain"] = g
+            apres_changement_gain(sc)
+
+    curseur_gain.config(command=sur_gain)
+
+    def prerequis_calage():
+        sc, ref = scan_selectionne(), scan_ref()
+        if not sc:
+            ecrire("Sélectionne d'abord le scan à corriger (clic sur son nom).")
+            return None
+        if not ref:
+            ecrire("Coche « Réf. » sur le scan de référence (par exemple ton scan Shure).")
+            return None
+        if ref is sc:
+            ecrire("Le scan sélectionné est aussi la référence : choisis un autre scan à corriger.")
+            return None
+        return sc, ref
+
+    def donnees_sans_gain(sc):
+        """Scan avec sa correction par bande mais sans son gain (le gain est ce qu'on calcule)."""
+        f = np.asarray(sc["f"], dtype=float)
+        d = np.asarray(sc["d"], dtype=float)
+        if sc.get("corr_f"):
+            d = d + np.interp(f, sc["corr_f"], sc["corr_d"])
+        return dict(zip(f.tolist(), d.tolist()))
+
+    def auto_gain():
+        r = prerequis_calage()
+        if not r:
+            return
+        sc, ref = r
+        try:
+            c = comparer(donnees_sans_gain(sc), donnees_effectives(ref))
+        except Exception as e:
+            ecrire(f"Calage impossible : {e}")
+            return
+        g = round(c["offset"], 1)
+        if abs(g) > 40:
+            ecrire(f"Écart de {g:+.1f} dB : au-delà du fader (±40 dB). Vérifie les deux scans.")
+            g = max(-40.0, min(40.0, g))
+        sc["gain"] = g
+        ecrire(f"Auto : « {sc['nom']} » calé sur « {ref['nom']} » : gain {g:+.1f} dB "
+               f"({c['plage'][0]:g} à {c['plage'][1]:g} MHz, {c['n']} points communs).")
+        if c["off_signal"] is not None:
+            ecrire(f"  écart sur les signaux ({c['n_signal']} pts) : {c['off_signal']:+.1f} dB, "
+                   f"sur tout le scan : {c['off_tout']:+.1f} dB")
+        ecrire("  par sous-bande : " + " ; ".join(f"{a:g}-{b:g} : {d:+.1f}" for a, b, d in c["bandes"]))
+        etendue = max(d for _, _, d in c["bandes"]) - min(d for _, _, d in c["bandes"])
+        if etendue > 3:
+            ecrire(f"  Attention : l'écart varie de {etendue:.1f} dB selon la bande. Un seul chiffre ne suffit pas : "
+                   "essaie « Auto par bande ».")
+        maj_gain_ui()
+        apres_changement_gain(sc)
+
+    def auto_bande():
+        r = prerequis_calage()
+        if not r:
+            return
+        sc, ref = r
+        brut = dict(zip(sc["f"], sc["d"]))
+        try:
+            fr, co, infos = correction_par_bande(brut, donnees_effectives(ref))
+        except Exception as e:
+            ecrire(f"Calage impossible : {e}")
+            return
+        sc["corr_f"], sc["corr_d"] = fr, co
+        sc["corr_ver"] = sc.get("corr_ver", 0) + 1
+        sc["gain"] = 0.0
+        ecrire(f"Auto par bande : « {sc['nom']} » corrigé sur « {ref['nom']} » : {infos['fenetres']} fenêtres de 4 MHz "
+               f"({infos['avec_signaux']} calées sur des signaux), correction de {infos['min']:+.1f} à {infos['max']:+.1f} dB.")
+        maj_gain_ui()
+        apres_changement_gain(sc)
+
+    def reinit_gain():
+        sc = scan_selectionne()
+        if not sc:
+            ecrire("Sélectionne d'abord un scan (clic sur son nom).")
+            return
+        sc["gain"] = 0.0
+        sc.pop("corr_f", None)
+        sc.pop("corr_d", None)
+        sc["corr_ver"] = sc.get("corr_ver", 0) + 1
+        maj_gain_ui()
+        apres_changement_gain(sc)
+        ecrire(f"Gain et correction de « {sc['nom']} » remis à zéro.")
+
+    # ---- export et image
     def exporter():
         sc = scan_selectionne()
         if not sc:
             ecrire("Sélectionne d'abord un scan dans la liste (clic sur son nom).")
-            return
-        try:
-            decalage = float(var_off.get().strip().replace(",", "."))
-        except ValueError:
-            ecrire("Décalage invalide : entre un nombre en dB (ex : 12 ou -3,5).")
             return
         chemin = filedialog.asksaveasfilename(
             title="Exporter le CSV pour WWB",
@@ -1059,18 +1266,20 @@ def main():
         )
         if not chemin:
             return
-        donnees = scan_donnees(sc)
+        donnees = donnees_effectives(sc)
         n = n_lissage(var_k.get())
         lisse = var_liss_ex.get() and n > 1
         if lisse:
             donnees = lisser(donnees, n)
-        ecrire_csv({k: v + decalage for k, v in donnees.items()}, chemin)
+        ecrire_csv(donnees, chemin)
         cfg["dossier_export"] = os.path.dirname(chemin)
         details = []
         if lisse:
             details.append(f"lissage {n} points")
-        if decalage:
-            details.append(f"décalage {decalage:+g} dB")
+        if sc.get("gain"):
+            details.append(f"gain {sc['gain']:+.1f} dB")
+        if sc.get("corr_f"):
+            details.append("correction par bande")
         ecrire(f"CSV exporté : {chemin}  [{sc['nom']}]" + (f"  ({', '.join(details)})" if details else ""))
 
     def enregistrer_image():
@@ -1084,7 +1293,7 @@ def main():
             filetypes=[("Image PNG", "*.png")],
         )
         if chemin:
-            fig.savefig(chemin, dpi=150)
+            fig.savefig(chemin, dpi=150, facecolor=fig.get_facecolor())
             ecrire(f"Image enregistrée : {chemin}")
 
     # ---- lancement des scans
@@ -1153,8 +1362,7 @@ def main():
 
     def terminer_scan(res):
         donnees = res["donnees"]
-        nom = var_nom.get().strip()
-        sc = creer_scan(sess["s"], nom, donnees, resume=res["resume"], passes=res["passes"],
+        sc = creer_scan(sess["s"], var_nom.get().strip(), donnees, resume=res["resume"], passes=res["passes"],
                         mode=res["mode"], source="tinySA", duree=res["duree"])
         sess["selection"] = sc["id"]
         live["acc"].clear()
@@ -1162,13 +1370,9 @@ def main():
         live["dirty"] = True
         vue["auto"] = True
         rebuild_liste()
-        if not sess["chemin"]:
-            ecrire("Scan terminé. Enregistre la session (nom du lieu) pour ne rien perdre...")
-            if not sauver_sous():
-                sess["modifie"] = True
-                maj_titre()
-        else:
-            enregistrer_auto()
+        maj_gain_ui()
+        marquer_modifie()
+        ecrire(f"Scan « {sc['nom']} » ajouté à la session (pas encore enregistrée : bouton Enregistrer).")
         top = pics(donnees, 5)
         ecrire("Pics les plus forts (lissés) : " + " ; ".join(
             f"{f:.2f} MHz {v:.1f} dBm" + (f" (canal {c})" if c else "") for f, v, c in top))
@@ -1176,25 +1380,25 @@ def main():
     # ---- réglages mémorisés
     def sauver_reglages():
         cfg.update({
-            "deb": var_deb.get(), "fin": var_fin.get(), "passes": var_passes.get(), "inf": var_inf.get(),
+            "v": 6, "deb": var_deb.get(), "fin": var_fin.get(), "passes": var_passes.get(), "inf": var_inf.get(),
             "max": var_max.get(), "nom_scan": var_nom.get(), "appl": var_appl.get(), "rbw": var_rbw.get(),
-            "att": var_att.get(), "lna": var_lna.get(), "off": var_off.get(),
-            "liss_export": var_liss_ex.get(), "k": int(var_k.get()), "brut": var_brut.get(),
-            "tnt": var_tnt.get(), "canaux": var_canaux.get(),
+            "att": var_att.get(), "lna": var_lna.get(), "liss_export": var_liss_ex.get(),
+            "k": int(var_k.get()), "brut": var_brut.get(), "tnt": var_tnt.get(), "canaux": var_canaux.get(),
         })
         sauver_config(cfg)
 
     def fermer():
-        if sess["s"]["scans"] and sess["modifie"] and not sess["chemin"]:
-            if not messagebox.askyesno("Quitter", "La session n'est pas enregistrée. Quitter quand même ?"):
-                return
+        if not confirmer_perte():
+            return
         stop.set()
         sauver_reglages()
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", fermer)
+    for combo in ("<Command-s>", "<Control-s>"):
+        root.bind(combo, lambda e: sauver())
 
-    # ---- curseur de lissage, seuil, curseur de souris
+    # ---- lissage, seuil, souris, zoom
     def maj_texte_lissage():
         n = n_lissage(var_k.get())
         var_liss_txt.set("aucun" if n == 1 else f"{n} points ({n * PAS_MHZ * 1000:g} kHz)")
@@ -1230,32 +1434,6 @@ def main():
         txt_seuil.set_text(f" seuil {seuil['y']:.1f} dBm")
         txt_seuil.set_visible(True)
 
-    def zoom_actif():
-        mode = getattr(toolbar, "mode", "") if toolbar else ""
-        mode = getattr(mode, "value", mode)
-        return mode not in ("", None)
-
-    def sur_clic(ev):
-        if ev.inaxes is ax and seuil["y"] is not None and not zoom_actif() and ev.ydata is not None:
-            bas, haut = ax.get_ylim()
-            if abs(ev.ydata - seuil["y"]) < 0.02 * (haut - bas):
-                seuil["drag"] = True
-
-    def sur_mouvement(ev):
-        if ev.inaxes is not ax or ev.xdata is None:
-            var_curseur.set("")
-            return
-        if seuil["drag"]:
-            seuil["y"] = round(ev.ydata, 1)
-            var_seuil.set(f"{seuil['y']:.1f}")
-            maj_seuil()
-            canvas.draw_idle()
-        c = canal_de(ev.xdata)
-        var_curseur.set(f"{ev.xdata:.3f} MHz   {ev.ydata:.1f} dBm" + (f"   (canal {c})" if c else ""))
-
-    def sur_relache(ev):
-        seuil["drag"] = False
-
     def sur_limites(_):
         if not vue["interne"]:
             vue["auto"] = False          # l'utilisateur a zoomé / déplacé la vue
@@ -1275,12 +1453,102 @@ def main():
         finally:
             vue["interne"] = False
 
+    def zoomer(facteur, centre=None):
+        xmin, xmax = ax.get_xlim()
+        c = (xmin + xmax) / 2 if centre is None else centre
+        largeur = max(0.2, (xmax - xmin) * facteur)
+        gauche = c - (c - xmin) * (largeur / (xmax - xmin))
+        ax.set_xlim(gauche, gauche + largeur)       # déclenche sur_limites : la vue n'est plus automatique
+
+    def trouver_pic(ev):
+        """Pic le plus proche du curseur parmi les courbes affichées : (distance, piste, x, y) ou None."""
+        xmin, xmax = ax.get_xlim()
+        tol = (xmax - xmin) * 10 / max(1.0, ax.bbox.width)          # fenêtre de 10 pixels
+        meilleur = None
+        for p in pistes:
+            xs, ys = p["x"], p["y"]
+            m = (xs >= ev.xdata - tol) & (xs <= ev.xdata + tol) & ~np.isnan(ys)
+            if not m.any():
+                continue
+            idx = np.where(m)[0]
+            k = int(idx[np.argmax(ys[idx])])
+            for _ in range(400):                                  # on monte jusqu'au sommet du pic
+                if k + 1 < len(ys) and ys[k + 1] > ys[k]:
+                    k += 1
+                elif k > 0 and ys[k - 1] > ys[k]:
+                    k -= 1
+                else:
+                    break
+            px = ax.transData.transform((xs[k], ys[k]))
+            dist = abs(px[1] - ev.y)
+            if dist < 45 and (meilleur is None or dist < meilleur[0]):
+                meilleur = (dist, p, float(xs[k]), float(ys[k]))
+        return meilleur
+
+    def cacher_bulle():
+        if bulle.get_visible() or marque_pic.get_visible():
+            bulle.set_visible(False)
+            marque_pic.set_visible(False)
+            canvas.draw_idle()
+
+    def sur_clic(ev):
+        if ev.inaxes is not ax or ev.xdata is None or ev.button not in (1, None):
+            return
+        if seuil["y"] is not None:
+            bas_y, haut_y = ax.get_ylim()
+            if abs(ev.ydata - seuil["y"]) < 0.02 * (haut_y - bas_y):
+                seuil["drag"] = True
+                return
+        pan.update(actif=True, x=ev.x, xlim=ax.get_xlim())
+
+    def sur_mouvement(ev):
+        if pan["actif"]:
+            x0, x1 = pan["xlim"]
+            dx = (ev.x - pan["x"]) * (x1 - x0) / max(1.0, ax.bbox.width)
+            ax.set_xlim(x0 - dx, x1 - dx)
+            return
+        if ev.inaxes is not ax or ev.xdata is None:
+            var_curseur.set("")
+            cacher_bulle()
+            return
+        if seuil["drag"]:
+            seuil["y"] = round(ev.ydata, 1)
+            var_seuil.set(f"{seuil['y']:.1f}")
+            maj_seuil()
+            canvas.draw_idle()
+        c = canal_de(ev.xdata)
+        var_curseur.set(f"{ev.xdata:.3f} MHz   {ev.ydata:.1f} dBm" + (f"   (canal {c})" if c else ""))
+        pic = trouver_pic(ev) if pistes and not seuil["drag"] else None
+        if pic is None:
+            cacher_bulle()
+            return
+        _, p, x, y = pic
+        cp = canal_de(x)
+        bulle.xy = (x, y)
+        bulle.set_text(f"{x:.3f} MHz\n{y:.1f} dBm" + (f"\ncanal {cp}" if cp else "") + f"\n{p['nom']}")
+        xmin, xmax = ax.get_xlim()
+        bulle.set_position((-120, 14) if x > xmin + 0.7 * (xmax - xmin) else (14, 14))
+        bulle.set_visible(True)
+        marque_pic.set_data([x], [y])
+        marque_pic.set_visible(True)
+        canvas.draw_idle()
+
+    def sur_relache(ev):
+        seuil["drag"] = False
+        pan["actif"] = False
+
+    def sur_molette(ev):
+        if ev.inaxes not in (ax, ax_tnt) or ev.xdata is None:
+            return
+        haut = getattr(ev, "step", 0) > 0 or getattr(ev, "button", "") == "up"
+        zoomer(0.8 if haut else 1.25, ev.xdata)
+
     if graphe:
         canvas.mpl_connect("button_press_event", sur_clic)
         canvas.mpl_connect("motion_notify_event", sur_mouvement)
         canvas.mpl_connect("button_release_event", sur_relache)
+        canvas.mpl_connect("scroll_event", sur_molette)
         ax.callbacks.connect("xlim_changed", sur_limites)
-        ax.callbacks.connect("ylim_changed", sur_limites)
 
     for v in (var_brut, var_tnt, var_canaux):
         v.trace_add("write", lambda *_: live.update(dirty=True))
@@ -1294,6 +1562,7 @@ def main():
 
     btn_nouv.config(command=nouvelle)
     btn_ouvrir.config(command=ouvrir)
+    btn_enreg.config(command=sauver)
     btn_sauver.config(command=sauver_sous)
     btn_go.config(command=lancer)
     btn_view.config(command=visualiser)
@@ -1303,8 +1572,12 @@ def main():
     btn_ren.config(command=renommer)
     btn_sup.config(command=supprimer)
     btn_imp.config(command=importer)
-    btn_cal.config(command=calibrer)
+    btn_auto.config(command=auto_gain)
+    btn_bande.config(command=auto_bande)
+    btn_rz.config(command=reinit_gain)
     btn_vue.config(command=vue_complete)
+    btn_zp.config(command=lambda: zoomer(0.5))
+    btn_zm.config(command=lambda: zoomer(2.0))
     btn_img.config(command=enregistrer_image)
 
     # ---- file de messages du thread de scan
@@ -1351,11 +1624,12 @@ def main():
 
     # ---- dessin de l'afficheur
     def courbe_scan(sc, n):
-        cle = (sc["id"], n)
+        cle = (sc["id"], n, sc.get("gain", 0.0), sc.get("corr_ver", 0), len(sc.get("corr_f", [])))
         if cle not in cache:
             if len(cache) > 60:
                 cache.clear()
-            cache[cle] = courbe(sc["f"], sc["d"], n)
+            f, d = scan_effectif(sc)
+            cache[cle] = courbe(f, d, n)
         return cache[cle]
 
     def rafraichir():
@@ -1363,28 +1637,29 @@ def main():
         if graphe and live["dirty"]:
             live["dirty"] = False
             n = n_lissage(var_k.get())
-            tous_y = []
             bornes_x = []
             poignees = []
+            pistes.clear()
             vus = set()
+            courbes = []                    # (xs, lissée, couleur) pour les remplissages
             for sc in sess["s"]["scans"]:
                 vus.add(sc["id"])
                 l = lignes.get(sc["id"])
                 if l is None:
-                    brut, lis = ax.plot([], [], linewidth=0.7, alpha=0.3)[0], ax.plot([], [], linewidth=1.8)[0]
-                    l = lignes[sc["id"]] = (brut, lis)
+                    l = lignes[sc["id"]] = (ax.plot([], [], linewidth=0.7, alpha=0.3)[0], ax.plot([], [], linewidth=1.8)[0])
                 brut, lis = l
                 visible = bool(sc.get("visible", True)) and bool(sc["f"])
                 brut.set_color(sc["couleur"])
                 lis.set_color(sc["couleur"])
                 brut.set_visible(visible and var_brut.get() and n > 1)
                 lis.set_visible(visible)
-                lis.set_label(sc["nom"])
+                lis.set_label(sc["nom"] + (" (réf.)" if sess["s"].get("ref") == sc["id"] else ""))
                 if visible:
                     xs, b, li = courbe_scan(sc, n)
                     brut.set_data(xs, b)
                     lis.set_data(xs, li)
-                    tous_y += [y for y in li if y == y] + [y for y in b if y == y]
+                    courbes.append((xs, li, sc["couleur"]))
+                    pistes.append({"nom": sc["nom"], "x": np.asarray(xs, dtype=float), "y": np.asarray(li, dtype=float)})
                     bornes_x += [sc["f"][0], sc["f"][-1]]
                     poignees.append(lis)
             for ident in list(lignes):
@@ -1404,7 +1679,7 @@ def main():
                 ligne_live.set_data(xs, li)
                 ligne_live_raw.set_visible(var_brut.get() and n > 1)
                 ligne_live.set_visible(True)
-                tous_y += [y for y in li if y == y] + [y for y in b if y == y]
+                pistes.append({"nom": "Scan en cours", "x": np.asarray(xs, dtype=float), "y": np.asarray(li, dtype=float)})
                 bornes_x += [fs[0], fs[-1]]
                 poignees.append(ligne_live)
             else:
@@ -1413,39 +1688,47 @@ def main():
             if live["now"][0]:
                 ligne_now.set_data(*live["now"])
                 ligne_now.set_visible(True)
-                tous_y += list(live["now"][1])
             else:
                 ligne_now.set_visible(False)
 
             if live["plan"] and (live["scan"] or not bornes_x):
                 bornes_x += [live["plan"][0][0], live["plan"][-1][1]]
 
-            # limites (sauf si l'utilisateur a zoomé)
-            if vue["auto"]:
-                if bornes_x:
-                    fixer_limites(x=(min(bornes_x), max(bornes_x)))
-                if tous_y:
-                    fixer_limites(y=(math.floor((min(tous_y) - 3) / 5) * 5, math.ceil((max(tous_y) + 3) / 5) * 5))
+            # limites : x automatique tant que l'utilisateur n'a pas zoomé ; y toujours ajusté à ce qu'on voit
+            if vue["auto"] and bornes_x:
+                fixer_limites(x=(min(bornes_x), max(bornes_x)))
+            xmin, xmax = ax.get_xlim()
+            vals = []
+            for p in pistes:
+                m = (p["x"] >= xmin) & (p["x"] <= xmax) & ~np.isnan(p["y"])
+                if m.any():
+                    vals.append((float(p["y"][m].min()), float(p["y"][m].max())))
+            if vals:
+                lo = min(v[0] for v in vals)
+                hi = max(v[1] for v in vals)
+                fixer_limites(y=(math.floor((lo - 4) / 5) * 5, math.ceil((hi + 4) / 5) * 5))
 
-            # repères : canaux TNT, tranche en cours
+            # remplissages, repères TNT, tranche en cours
             for a in deco:
                 try:
                     a.remove()
                 except Exception:
                     pass
             deco.clear()
-            xmin, xmax = ax.get_xlim()
-            deco.extend(dessiner_canaux(ax, xmin, xmax, lire_canaux(var_canaux.get()), var_tnt.get()))
+            for xs, li, couleur in courbes:
+                deco.append(ax.fill_between(xs, li, -300, color=couleur, alpha=0.18, linewidth=0))
+            deco.extend(dessiner_tnt(ax, ax_tnt, xmin, xmax, lire_canaux(var_canaux.get()), var_tnt.get()))
             if live["scan"] and live["courant"]:
                 a, b = live["courant"]
-                deco.append(ax.axvspan(a, b, color="gold", alpha=0.18, linewidth=0))
+                deco.append(ax.axvspan(a, b, color="gold", alpha=0.15, linewidth=0))
             maj_seuil()
 
             ax.set_title(live.get("titre", "") if live["scan"] else
-                         (f"{sess['s']['nom']}" + (f"  -  {len(poignees)} scan(s) affiché(s)" if poignees else "")),
-                         fontsize=12)
+                         (sess["s"]["nom"] + (f"  -  {len(poignees)} scan(s) affiché(s)" if poignees else "")),
+                         color="#dddddd", fontsize=12)
             if poignees:
-                ax.legend(handles=poignees, loc="upper right", fontsize=9)
+                leg = ax.legend(handles=poignees, loc="upper right", fontsize=9, facecolor="#1e1e1e",
+                                edgecolor="#555555", labelcolor="white")
             elif ax.get_legend():
                 ax.get_legend().remove()
             canvas.draw_idle()
@@ -1460,6 +1743,7 @@ def main():
         except Exception as e:
             ecrire(f"Dernière session non rouverte : {e}")
     rebuild_liste()
+    maj_gain_ui()
     maj_titre()
     sur_seuil()
     rafraichir()
