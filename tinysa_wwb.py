@@ -1,0 +1,1471 @@
+#!/usr/bin/env python3
+"""
+tinySA -> Wireless Workbench (sessions, passes multiples, afficheur large)
+
+Lancer :  python3 tinysa_wwb.py
+Prérequis (une fois) :  pip3 install pyserial matplotlib
+NB : non testé sur un vrai tinySA Ultra+ ZS-407 au moment de l'écriture.
+     Utilise la case "Mode démo" pour tester sans appareil.
+"""
+import csv
+import datetime
+import glob
+import json
+import math
+import os
+import queue
+import random
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+
+POINTS = 450                       # points par balayage
+PAS_MHZ = 0.025                    # pas de 25 kHz (minimum accepté par WWB)
+DEBUT_DEFAUT = "470"
+FIN_DEFAUT = "670"
+CONFIG = os.path.join(os.path.expanduser("~"), ".tinysa_wwb.json")   # réglages mémorisés
+
+
+# ---------- Communication avec le tinySA ----------
+
+def trouver_port():
+    ports = sorted(glob.glob("/dev/cu.usbmodem*"))
+    return ports[0] if ports else None
+
+
+def envoyer(ser, commande, timeout=30):
+    """Envoie une commande et renvoie les lignes de réponse."""
+    ser.reset_input_buffer()
+    ser.write((commande + "\r").encode())
+    buf = b""
+    t0 = time.time()
+    while not buf.endswith(b"ch> "):
+        morceau = ser.read(4096)
+        if morceau:
+            buf += morceau
+        elif time.time() - t0 > timeout:
+            raise TimeoutError(f"Pas de réponse à : {commande}")
+    lignes = buf.decode(errors="ignore").replace("\r", "").split("\n")
+    return [l.strip() for l in lignes[1:] if l.strip() and l.strip() != "ch>"]
+
+
+def un_balayage(ser, debut_mhz, fin_mhz):
+    lignes = envoyer(ser, f"scan {int(debut_mhz * 1e6)} {int(fin_mhz * 1e6)} {POINTS} 3")
+    freqs, niveaux = [], []
+    for l in lignes:
+        parts = l.split()
+        if len(parts) >= 2:
+            try:
+                freqs.append(float(parts[0]) / 1e6)
+                niveaux.append(float(parts[1]))
+            except ValueError:
+                pass
+    return freqs, niveaux
+
+
+def balayage_demo(debut_mhz, fin_mhz):
+    pas = (fin_mhz - debut_mhz) / (POINTS - 1)
+    freqs = [debut_mhz + i * pas for i in range(POINTS)]
+    niveaux = []
+    for f in freqs:
+        bruit = -100 + random.uniform(-3, 3)
+        pic = 40 * math.exp(-((f - 482) ** 2) / 8) + 30 * math.exp(-((f - 620.4) ** 2) / 0.05)
+        # un émetteur intermittent à 495 MHz (1 s sur 3), pour voir l'effet du Max Hold
+        if int(time.time()) % 3 == 0 and abs(f - 495) < 0.1:
+            pic += 35
+        niveaux.append(bruit + pic)
+    return freqs, niveaux
+
+
+def balayer(ser, debut_mhz, fin_mhz, demo):
+    """Un balayage, réel ou simulé."""
+    if demo:
+        time.sleep(0.2)
+        return balayage_demo(debut_mhz, fin_mhz)
+    for essai in range(3):               # un balayage perdu ne doit pas faire échouer tout le scan
+        try:
+            return un_balayage(ser, debut_mhz, fin_mhz)
+        except TimeoutError:
+            if essai == 2:
+                raise
+            time.sleep(0.5)
+
+
+# ---------- Logique de scan ----------
+
+def generer_tranches(debut, fin):
+    """Tranches de 450 points au pas exact de 25 kHz (11,25 MHz chacune).
+
+    Chaque tranche démarre sur la grille 470 + k x 11,25 MHz (comme SoundBase)
+    et s'arrête 449 pas plus loin : la tranche suivante reprend au pas suivant,
+    sans trou ni doublon. La dernière tranche peut dépasser un peu 'fin'.
+    """
+    if fin <= debut:
+        raise ValueError("fin <= début")
+    largeur = POINTS * PAS_MHZ              # 11,25 MHz
+    n = int(math.ceil((fin - debut) / largeur - 1e-9))
+    res = []
+    for k in range(n):
+        a = round(debut + k * largeur, 6)
+        res.append((a, round(a + (POINTS - 1) * PAS_MHZ, 6)))
+    return res
+
+
+def boucle_visualiseur(ser, p, msg, stop):
+    """Balayages en boucle sur toutes les tranches. Rien n'est enregistré.
+    Max Hold coché : on garde le maximum. Sinon : moyenne glissante (80 % ancien / 20 % nouveau)."""
+    reset = p.get("reset") or threading.Event()
+    etat = {}
+    total = len(p["tranches"])
+    passage = 0
+    while not stop.is_set():
+        passage += 1
+        for idx, (debut, fin) in enumerate(p["tranches"]):
+            if stop.is_set():
+                break
+            if reset.is_set():
+                etat.clear()
+                reset.clear()
+            f, d = balayer(ser, debut, fin, p["demo"])
+            if not f:
+                time.sleep(0.2)
+                continue
+            prec = etat.get(idx)
+            if prec is None or len(prec) != len(d):
+                acc = list(d)
+            elif p["maxhold"]:
+                acc = [max(a, b) for a, b in zip(prec, d)]
+            else:
+                acc = [0.8 * a + 0.2 * b for a, b in zip(prec, d)]
+            etat[idx] = acc
+            msg("live", (idx, f, d, acc, passage))
+            msg("status", f"Visualiseur : tranche {idx + 1}/{total}, passage {passage}")
+
+
+def decrire_reglages(p):
+    if not p.get("appliquer"):
+        return "réglages de l'appareil inchangés"
+    rbw = "auto" if p["rbw"] == "auto" else f"{p['rbw']} kHz"
+    if p["lna"]:
+        return f"RBW {rbw}, LNA on"
+    att = "auto" if p["att"] == "auto" else f"{p['att']} dB"
+    return f"RBW {rbw}, atténuation {att}, LNA off"
+
+
+def appliquer_reglages(ser, p, msg):
+    """Envoie LNA / atténuation / RBW au tinySA et affiche ses réponses."""
+    cmds = [f"lna {'on' if p['lna'] else 'off'}"]
+    if not p["lna"]:  # LNA et atténuateur s'excluent sur l'Ultra
+        cmds.append(f"attenuate {p['att']}")
+    cmds.append(f"rbw {p['rbw']}")
+    for c in cmds:
+        rep = envoyer(ser, c)
+        if c == "rbw auto" and any("usage" in l.lower() for l in rep):
+            c = "rbw 0"  # ancienne syntaxe : 0 = auto
+            rep = envoyer(ser, c)
+        msg("log", f"  {c}" + (f"  ->  {' '.join(rep)}" if rep else ""))
+
+
+LISSAGE_PTS = 9      # moyenne glissante sur 9 points (225 kHz), pour l'export et le visualiseur
+
+
+def lisser_valeurs(vals, n=LISSAGE_PTS):
+    """Moyenne glissante sur n points d'une liste de niveaux (dBm), calculée en puissance (mW).
+    La fenêtre se réduit aux bords. Rapide (sommes cumulées) : sert aussi au visualiseur."""
+    if not vals:
+        return []
+    demi = n // 2
+    cum = [0.0]
+    for v in vals:
+        cum.append(cum[-1] + 10 ** (v / 10))
+    sortie = []
+    for i, v in enumerate(vals):
+        a = max(0, i - demi)
+        b = min(len(vals), i + demi + 1)
+        moy = (cum[b] - cum[a]) / (b - a)
+        sortie.append(10 * math.log10(moy) if moy > 0 else v)
+    return sortie
+
+
+def lisser(donnees, n=LISSAGE_PTS):
+    """Lisse le scan à l'export ({MHz: dBm} -> nouveau dictionnaire), morceau continu par morceau
+    continu : jamais de calcul à travers un trou du scan. Un lissage abaisse un peu les pics étroits."""
+    if not donnees:
+        return {}
+    freqs = sorted(donnees)
+    morceaux, courant = [], [freqs[0]]
+    for a, b in zip(freqs, freqs[1:]):
+        if b - a > PAS_MHZ * 1.5:
+            morceaux.append(courant)
+            courant = []
+        courant.append(b)
+    morceaux.append(courant)
+    sortie = {}
+    for morceau in morceaux:
+        for f, v in zip(morceau, lisser_valeurs([donnees[f] for f in morceau], n)):
+            sortie[f] = v
+    return sortie
+
+
+# ---------- Canaux TNT ----------
+
+def canal_tnt(n):
+    """Canal TNT (UHF) n -> (début, fin) en MHz. Canal 21 = 470-478 MHz, 8 MHz de large."""
+    debut = 470 + (n - 21) * 8
+    return debut, debut + 8
+
+
+def canal_de(mhz):
+    if mhz < 470 or mhz >= 790:
+        return None
+    return int((mhz - 470) // 8) + 21
+
+
+def lire_canaux(texte):
+    """'22, 23 25' -> {22, 23, 25} (canaux 21 à 60 seulement ; le reste est ignoré)."""
+    res = set()
+    for m in re.findall(r"\d+", texte or ""):
+        if 21 <= int(m) <= 60:
+            res.add(int(m))
+    return res
+
+
+def dessiner_canaux(ax, xmin, xmax, surlignes=(), afficher=True):
+    """Repères des canaux TNT : trait à chaque début de canal, numéro en bas, canaux surlignés en rouge.
+    Renvoie les éléments dessinés (pour pouvoir les effacer)."""
+    arts = []
+    if not afficher:
+        return arts
+    for n in range(21, 61):
+        a, b = canal_tnt(n)
+        if b < xmin or a > xmax:
+            continue
+        if n in surlignes:
+            arts.append(ax.axvspan(max(a, xmin), min(b, xmax), color="tab:red", alpha=0.15, linewidth=0))
+        arts.append(ax.axvline(a, color="gray", alpha=0.3, linewidth=0.5))
+        centre = (max(a, xmin) + min(b, xmax)) / 2
+        arts.append(ax.text(centre, 0.01, str(n), transform=ax.get_xaxis_transform(),
+                            ha="center", va="bottom", fontsize=9, color="#444444"))
+    return arts
+
+
+def pics(donnees, n=5, ecart=1.0):
+    """Les n pics les plus forts du scan lissé, espacés d'au moins 'ecart' MHz : [(MHz, dBm, canal)]."""
+    lis = lisser(donnees)
+    res = []
+    for f in sorted(lis, key=lambda x: -lis[x]):
+        if all(abs(f - g) >= ecart for g, _ in res):
+            res.append((f, lis[f]))
+            if len(res) == n:
+                break
+    return [(f, v, canal_de(f)) for f, v in res]
+
+
+# ---------- Comparaison avec un scan Shure (calibration) ----------
+
+def lire_shure(chemin):
+    """Lit un scan Shure : .sdb3 (Wireless Workbench / ULX-D) ou CSV 'MHz,dBm'. Renvoie {MHz: dBm}."""
+    if chemin.lower().endswith(".sdb3"):
+        d = open(chemin, "rb").read()
+        marque = b"@Binary:@Swp"
+        i = d.find(marque)
+        if i < 0 or not d.startswith(b"//@ShureScan"):
+            raise ValueError("Fichier .sdb3 non reconnu.")
+        entete = json.loads(d[:i].decode("utf-8", errors="ignore").split("\n", 1)[1])
+        courbe = next(x["Curve"] for x in entete["BinarySchema"] if "Curve" in x)
+        plage = courbe["FreqRanges"][0]            # en kHz
+        pas = plage["StepFreq"]
+        n = (plage["EndFreq"] - plage["StartFreq"]) // pas + 1
+        corps = d[i + len(marque) + 8:]            # 8 octets d'en-tête de balayage, puis n valeurs int16
+        if len(corps) < 2 * n:
+            raise ValueError("Fichier .sdb3 incomplet.")
+        facteur = entete.get("Scale Factor", 10)
+        vals = struct.unpack(">%dh" % n, corps[:2 * n])
+        return {round((plage["StartFreq"] + k * pas) / 1000, 3): v / facteur for k, v in enumerate(vals)}
+    res = {}
+    with open(chemin, encoding="utf-8", errors="ignore") as f:
+        for ligne in f:
+            ligne = ligne.strip()
+            if not ligne:
+                continue
+            if ";" in ligne:
+                morceaux = [x.replace(",", ".") for x in ligne.split(";")]
+            else:
+                morceaux = re.split(r"[,\t ]+", ligne)
+            try:
+                res[round(float(morceaux[0]), 3)] = float(morceaux[1])
+            except (ValueError, IndexError):
+                continue                           # en-tête ou ligne invalide
+    if not res:
+        raise ValueError("Aucune ligne 'MHz,dBm' lisible dans ce fichier.")
+    return res
+
+
+def _mediane(v):
+    v = sorted(v)
+    m = len(v) // 2
+    return v[m] if len(v) % 2 else (v[m - 1] + v[m]) / 2
+
+
+def comparer(tiny, shure):
+    """Compare un scan tinySA et un scan Shure sur leurs fréquences communes (les deux lissés 9 pts).
+    Décalage = Shure - tinySA : c'est ce qu'il faut ajouter au tinySA pour retrouver le niveau Shure."""
+    t = {round(f, 3): v for f, v in lisser(tiny).items()}
+    s = {round(f, 3): v for f, v in lisser(shure).items()}
+    comm = sorted(set(t) & set(s))
+    if len(comm) < 50:
+        raise ValueError("Pas assez de fréquences en commun (il faut au moins 50 points entre les deux scans).")
+    plancher_t = _mediane([t[f] for f in comm])
+    plancher_s = _mediane([s[f] for f in comm])
+    diffs = {f: s[f] - t[f] for f in comm}
+    signal = [f for f in comm if t[f] > plancher_t + 10 or s[f] > plancher_s + 10]
+    off_tout = _mediane(list(diffs.values()))
+    off_sig = _mediane([diffs[f] for f in signal]) if len(signal) >= 10 else None
+    quart = len(comm) // 4
+    bandes = []
+    for k in range(4):
+        sous = comm[k * quart:(k + 1) * quart] if k < 3 else comm[3 * quart:]
+        bandes.append((sous[0], sous[-1], _mediane([diffs[f] for f in sous])))
+    return {
+        "n": len(comm), "plage": (comm[0], comm[-1]),
+        "plancher_tiny": plancher_t, "plancher_shure": plancher_s,
+        "off_tout": off_tout, "off_signal": off_sig, "n_signal": len(signal),
+        "offset": off_sig if off_sig is not None else off_tout,
+        "bandes": bandes,
+    }
+
+
+# ---------- Réglages mémorisés / noms de fichiers ----------
+
+def charger_config():
+    try:
+        with open(CONFIG, encoding="utf-8") as f:
+            c = json.load(f)
+        return c if isinstance(c, dict) else {}
+    except Exception:
+        return {}
+
+
+def sauver_config(cfg):
+    try:
+        with open(CONFIG, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass                                        # jamais bloquant
+
+
+def nom_fichier(nom, ext):
+    base = re.sub(r"[^\w\-]+", "_", (nom or "").strip()).strip("_") or "scan"
+    return f"{base}_{datetime.date.today():%Y-%m-%d}.{ext}"
+
+
+def ecrire_csv(donnees, chemin):
+    """Format WWB : fréquence (MHz), niveau (dBm), sans en-tête."""
+    with open(chemin, "w", newline="") as f:
+        w = csv.writer(f)
+        for mhz in sorted(donnees):
+            w.writerow([f"{mhz:.4f}", f"{donnees[mhz]:.1f}"])
+
+
+
+
+# ---------- Sessions et scans ----------
+
+PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#17becf"]
+LISSAGE_K_MAX = 20           # curseur de lissage : k de 0 à 20  ->  1 + 2k points (1 à 41)
+EXTENSION = ".tinysa"
+
+
+def n_lissage(k):
+    return 1 + 2 * int(round(float(k)))
+
+
+def nouvelle_session():
+    return {"version": 1, "nom": "Sans titre", "scans": []}
+
+
+def creer_scan(session, nom, donnees, **meta):
+    """Ajoute un scan ({MHz: dBm}) à la session. Nom unique, couleur suivante de la palette."""
+    nom = (nom or "").strip() or f"Scan {len(session['scans']) + 1}"
+    base, k = nom, 2
+    pris = {s["nom"] for s in session["scans"]}
+    while nom in pris:
+        nom = f"{base} ({k})"
+        k += 1
+    freqs = sorted(donnees)
+    scan = {
+        "id": uuid.uuid4().hex[:8],
+        "nom": nom,
+        "date": datetime.datetime.now().isoformat(timespec="seconds"),
+        "couleur": PALETTE[len(session["scans"]) % len(PALETTE)],
+        "visible": True,
+        "f": [round(x, 4) for x in freqs],
+        "d": [round(donnees[x], 1) for x in freqs],
+    }
+    scan.update(meta)
+    session["scans"].append(scan)
+    return scan
+
+
+def scan_donnees(scan):
+    return dict(zip(scan["f"], scan["d"]))
+
+
+def decrire_scan(scan):
+    f = scan["f"]
+    plage = f"{f[0]:g} - {f[-1]:g} MHz" if f else "vide"
+    try:
+        jour = datetime.datetime.fromisoformat(scan["date"]).strftime("%d/%m %H:%M")
+    except (KeyError, ValueError):
+        jour = ""
+    extra = scan.get("resume", "")
+    return f"{plage}   {jour}" + (f"\n{extra}" if extra else "")
+
+
+def sauver_session(session, chemin):
+    """Écriture sûre : fichier temporaire puis remplacement (pas de fichier à moitié écrit)."""
+    tmp = chemin + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(session, f, ensure_ascii=False, separators=(",", ":"))
+    os.replace(tmp, chemin)
+
+
+def charger_session(chemin):
+    with open(chemin, encoding="utf-8") as f:
+        s = json.load(f)
+    if not isinstance(s, dict) or not isinstance(s.get("scans"), list):
+        raise ValueError("Ce fichier n'est pas une session tinySA.")
+    s.setdefault("nom", os.path.splitext(os.path.basename(chemin))[0])
+    for sc in s["scans"]:
+        sc.setdefault("id", uuid.uuid4().hex[:8])
+        sc.setdefault("couleur", PALETTE[0])
+        sc.setdefault("visible", True)
+        if len(sc.get("f", [])) != len(sc.get("d", [])):
+            raise ValueError(f"Scan « {sc.get('nom', '?')} » corrompu.")
+    return s
+
+
+def courbe(freqs, vals, n):
+    """(xs, brut, lissé) avec un NaN à chaque trou : on ne relie jamais à travers un trou,
+    et le lissage (n points, en puissance) est calculé morceau continu par morceau continu."""
+    nan = float("nan")
+    xs, brut, lis = [], [], []
+    debut = 0
+    for i in range(1, len(freqs) + 1):
+        if i == len(freqs) or freqs[i] - freqs[i - 1] > PAS_MHZ * 1.5:
+            f, v = freqs[debut:i], vals[debut:i]
+            if xs:
+                xs.append(nan)
+                brut.append(nan)
+                lis.append(nan)
+            xs += f
+            brut += v
+            lis += lisser_valeurs(v, n)
+            debut = i
+    return xs, brut, lis
+
+
+# ---------- Travail en arrière-plan ----------
+
+def travail(p, msg, stop):
+    """Scan par passes complètes : on balaie toute la plage (tranche après tranche, de gauche à droite),
+    puis on recommence. Chaque passe affine le cumul (Max Hold ou moyenne). 'Arrêter' garde tout."""
+    ser = None
+    try:
+        if not p["demo"]:
+            try:
+                import serial
+            except ImportError:
+                raise RuntimeError("pyserial manquant : pip3 install pyserial")
+            port = trouver_port()
+            if not port:
+                raise RuntimeError("tinySA introuvable (/dev/cu.usbmodem*). Branche-le en USB.")
+            msg("log", f"Port : {port}")
+            ser = serial.Serial(port, 115200, timeout=0.5)
+            envoyer(ser, "pause")
+            try:
+                version = envoyer(ser, "version", timeout=3)
+                if version:
+                    msg("log", "Appareil : " + " ".join(version))
+            except Exception:
+                pass
+            if p["appliquer"]:
+                msg("log", "Application des réglages :")
+                appliquer_reglages(ser, p, msg)
+
+        reglages = decrire_reglages(p)
+        msg("log", f"Réglages : {reglages}")
+        msg("plan", p["tranches"])
+        if p.get("viewer"):
+            msg("log", "Visualiseur en marche (rien n'est enregistré). Clique sur Arrêter pour finir.")
+            boucle_visualiseur(ser, p, msg, stop)
+            msg("log", "Visualiseur arrêté.")
+            return
+
+        n_tr = len(p["tranches"])
+        passes = p["passes"]                    # 0 = jusqu'à l'arrêt
+        etat = {}                               # idx -> [freqs, maxi, somme, nb de balayages]
+        passe = 0
+        completes = 0
+        t0 = time.time()
+        while not stop.is_set() and (passes == 0 or passe < passes):
+            passe += 1
+            fini = True
+            for idx, (debut, fin) in enumerate(p["tranches"]):
+                if stop.is_set():
+                    fini = False
+                    break
+                f, d = balayer(ser, debut, fin, p["demo"])
+                if not f:
+                    continue
+                e = etat.get(idx)
+                if e is None or len(e[1]) != len(d):
+                    e = etat[idx] = [f, list(d), list(d), 1]
+                else:
+                    e[1] = [max(a, b) for a, b in zip(e[1], d)]
+                    e[2] = [a + b for a, b in zip(e[2], d)]
+                    e[3] += 1
+                acc = e[1] if p["maxhold"] else [x / e[3] for x in e[2]]
+                msg("live", (idx, f, d, acc, passe))
+                sur = f"/{passes}" if passes else ""
+                msg("status", f"Passe {passe}{sur}  -  tranche {idx + 1}/{n_tr}  -  {int(time.time() - t0)} s")
+                if passes:
+                    msg("progress", ((passe - 1) * n_tr + idx + 1) / (passes * n_tr))
+                else:
+                    msg("progress", (idx + 1) / n_tr)
+            if fini:
+                completes += 1
+        if not etat:
+            raise RuntimeError("Aucune donnée reçue du tinySA (vérifie le câble).")
+        donnees = {}
+        for idx in sorted(etat):
+            f, mx, so, nb = etat[idx]
+            niv = mx if p["maxhold"] else [x / nb for x in so]
+            for mhz, dbm in zip(f, niv):
+                cle = round(mhz, 4)
+                donnees[cle] = max(dbm, donnees.get(cle, -999))
+        mode = "Max Hold" if p["maxhold"] else "moyenne"
+        partielle = len(etat) < n_tr or completes < passe
+        resume = f"{completes} passe(s) {mode}" + (" + passe partielle" if partielle else "") + f", {reglages}"
+        msg("result", {"donnees": donnees, "resume": resume, "passes": completes, "mode": mode,
+                       "duree": int(time.time() - t0)})
+        msg("log", f"Scan terminé : {len(donnees)} points, {resume}.")
+    except Exception as e:
+        if isinstance(e, OSError):
+            msg("log", f"ERREUR : liaison USB perdue (câble débranché ?) - {e}")
+        else:
+            msg("log", f"ERREUR : {e}")
+    finally:
+        if ser:
+            try:
+                envoyer(ser, "resume")
+            except Exception:
+                pass
+            try:
+                ser.close()
+            except Exception:
+                pass
+        msg("done", "")
+
+
+# ---------- Fenêtre ----------
+
+def main():
+    try:
+        import tkinter as tk
+        from tkinter import ttk, filedialog, messagebox, simpledialog, colorchooser
+    except ImportError:
+        sys.exit("Tkinter indisponible. Installe Python depuis python.org (Tkinter inclus).")
+
+    cfg = charger_config()
+
+    def c_str(cle, defaut):
+        return str(cfg.get(cle, defaut))
+
+    def c_bool(cle, defaut):
+        return bool(cfg.get(cle, defaut))
+
+    sess = {"s": nouvelle_session(), "chemin": None, "modifie": False, "selection": None}
+    q = queue.Queue()
+    stop = threading.Event()
+    reset = threading.Event()
+    live = {"plan": [], "acc": {}, "now": ([], []), "courant": None, "dirty": True, "scan": False}
+    vue = {"auto": True, "interne": False}
+    seuil = {"y": None, "drag": False}
+    lignes = {}          # id du scan -> (ligne brute, ligne lissée)
+    cache = {}           # (id, n) -> courbe
+
+    root = tk.Tk()
+    root.title("tinySA -> WWB")
+    root.geometry("1450x860")
+    root.minsize(1100, 680)
+    root.columnconfigure(1, weight=1)
+    root.rowconfigure(0, weight=1)
+
+    # ---- variables
+    var_deb = tk.StringVar(value=c_str("deb", DEBUT_DEFAUT))
+    var_fin = tk.StringVar(value=c_str("fin", FIN_DEFAUT))
+    var_passes = tk.StringVar(value=c_str("passes", "6"))
+    var_inf = tk.BooleanVar(value=c_bool("inf", False))
+    var_max = tk.BooleanVar(value=c_bool("max", True))
+    var_nom = tk.StringVar(value=c_str("nom_scan", ""))
+    var_appl = tk.BooleanVar(value=c_bool("appl", True))
+    var_rbw = tk.StringVar(value=c_str("rbw", "300"))
+    var_att = tk.StringVar(value=c_str("att", "auto"))
+    var_lna = tk.BooleanVar(value=c_bool("lna", True))
+    var_demo = tk.BooleanVar(value=False)
+    var_off = tk.StringVar(value=c_str("off", "0"))
+    var_liss_ex = tk.BooleanVar(value=c_bool("liss_export", True))
+    var_k = tk.IntVar(value=int(cfg.get("k", 4)))            # 4 -> 9 points (225 kHz)
+    var_brut = tk.BooleanVar(value=c_bool("brut", True))
+    var_tnt = tk.BooleanVar(value=c_bool("tnt", True))
+    var_canaux = tk.StringVar(value=c_str("canaux", ""))
+    var_seuil = tk.StringVar(value="")
+    var_statut = tk.StringVar(value="Prêt.")
+    var_curseur = tk.StringVar(value="")
+    var_liss_txt = tk.StringVar(value="")
+    var_session = tk.StringVar(value="")
+
+    # ---- colonne de gauche
+    gauche = ttk.Frame(root, padding=(10, 8, 6, 8))
+    gauche.grid(row=0, column=0, sticky="ns")
+    gauche.rowconfigure(5, weight=1)
+
+    ligne_s = ttk.Frame(gauche)
+    ligne_s.grid(row=0, column=0, sticky="we")
+    ttk.Label(ligne_s, textvariable=var_session, font=("Helvetica", 14, "bold")).grid(
+        row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+    btn_nouv = ttk.Button(ligne_s, text="Nouvelle")
+    btn_nouv.grid(row=1, column=0, padx=(0, 4))
+    btn_ouvrir = ttk.Button(ligne_s, text="Ouvrir...")
+    btn_ouvrir.grid(row=1, column=1, padx=(0, 4))
+    btn_sauver = ttk.Button(ligne_s, text="Enregistrer sous...")
+    btn_sauver.grid(row=1, column=2)
+
+    ttk.Separator(gauche).grid(row=1, column=0, sticky="we", pady=6)
+
+    reg = ttk.Frame(gauche)
+    reg.grid(row=2, column=0, sticky="we")
+    ttk.Label(reg, text="Plage (MHz) :").grid(row=0, column=0, sticky="w")
+    pl = ttk.Frame(reg)
+    pl.grid(row=0, column=1, columnspan=3, sticky="w")
+    ttk.Entry(pl, textvariable=var_deb, width=6).grid(row=0, column=0)
+    ttk.Label(pl, text=" à ").grid(row=0, column=1)
+    ttk.Entry(pl, textvariable=var_fin, width=6).grid(row=0, column=2)
+    ttk.Label(reg, text="Passes :").grid(row=1, column=0, sticky="w", pady=(4, 0))
+    pa = ttk.Frame(reg)
+    pa.grid(row=1, column=1, columnspan=3, sticky="w", pady=(4, 0))
+    ent_passes = ttk.Entry(pa, textvariable=var_passes, width=4)
+    ent_passes.grid(row=0, column=0)
+    chk_inf = ttk.Checkbutton(pa, text="jusqu'à l'arrêt", variable=var_inf)
+    chk_inf.grid(row=0, column=1, padx=(8, 0))
+    ttk.Checkbutton(reg, text="Max Hold (sinon : moyenne)", variable=var_max).grid(
+        row=2, column=0, columnspan=4, sticky="w", pady=(2, 0))
+    ttk.Label(reg, text="Nom du scan :").grid(row=3, column=0, sticky="w", pady=(6, 0))
+    ttk.Entry(reg, textvariable=var_nom, width=22).grid(row=3, column=1, columnspan=3, sticky="we", pady=(6, 0))
+    ttk.Label(reg, text="(ex : antenne cardio, omni...)", foreground="gray").grid(
+        row=4, column=1, columnspan=3, sticky="w")
+
+    app = ttk.Frame(gauche)
+    app.grid(row=3, column=0, sticky="we", pady=(6, 0))
+    ttk.Checkbutton(app, text="Appliquer ces réglages à l'appareil", variable=var_appl).grid(
+        row=0, column=0, columnspan=4, sticky="w")
+    ttk.Label(app, text="RBW (kHz)").grid(row=1, column=0, sticky="w", padx=(18, 0))
+    ttk.Combobox(app, textvariable=var_rbw, values=["auto", "10", "30", "100", "300", "600"], width=6).grid(
+        row=1, column=1, padx=(4, 10))
+    ttk.Label(app, text="Atténuation (dB)").grid(row=1, column=2)
+    ttk.Combobox(app, textvariable=var_att, values=["auto", "0", "10", "20", "30"], width=6).grid(
+        row=1, column=3, padx=(4, 0))
+    ttk.Checkbutton(app, text="LNA (désactive l'atténuation)", variable=var_lna).grid(
+        row=2, column=0, columnspan=4, sticky="w", padx=(18, 0))
+    ttk.Checkbutton(app, text="Mode démo (sans appareil)", variable=var_demo).grid(
+        row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
+
+    barre = ttk.Frame(gauche)
+    barre.grid(row=4, column=0, sticky="we", pady=8)
+    btn_go = ttk.Button(barre, text="Lancer le scan")
+    btn_go.grid(row=0, column=0, padx=(0, 4))
+    btn_view = ttk.Button(barre, text="Visualiser en direct")
+    btn_view.grid(row=0, column=1, padx=(0, 4))
+    btn_stop = ttk.Button(barre, text="Arrêter", state="disabled")
+    btn_stop.grid(row=0, column=2)
+    btn_reset = ttk.Button(barre, text="Effacer le cumul", state="disabled")
+    btn_reset.grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
+    # ---- Scan data
+    sd = ttk.LabelFrame(gauche, text="Scan data", padding=6)
+    sd.grid(row=5, column=0, sticky="nsew")
+    sd.rowconfigure(0, weight=1)
+    sd.columnconfigure(0, weight=1)
+    zone = tk.Canvas(sd, width=330, height=230, highlightthickness=0)
+    zone.grid(row=0, column=0, sticky="nsew")
+    asc = ttk.Scrollbar(sd, orient="vertical", command=zone.yview)
+    asc.grid(row=0, column=1, sticky="ns")
+    zone.configure(yscrollcommand=asc.set)
+    liste = ttk.Frame(zone)
+    zone.create_window((0, 0), window=liste, anchor="nw")
+    liste.bind("<Configure>", lambda e: zone.configure(scrollregion=zone.bbox("all")))
+
+    act = ttk.Frame(sd)
+    act.grid(row=1, column=0, columnspan=2, sticky="we", pady=(6, 0))
+    btn_export = ttk.Button(act, text="Exporter le scan sélectionné (CSV WWB)...")
+    btn_export.grid(row=0, column=0, columnspan=3, sticky="we")
+    btn_ren = ttk.Button(act, text="Renommer")
+    btn_ren.grid(row=1, column=0, pady=(4, 0), sticky="we")
+    btn_sup = ttk.Button(act, text="Supprimer")
+    btn_sup.grid(row=1, column=1, pady=(4, 0), sticky="we")
+    btn_imp = ttk.Button(act, text="Importer...")
+    btn_imp.grid(row=1, column=2, pady=(4, 0), sticky="we")
+    btn_cal = ttk.Button(act, text="Calibrer sur un scan de référence")
+    btn_cal.grid(row=2, column=0, columnspan=3, sticky="we", pady=(4, 0))
+    ex = ttk.Frame(act)
+    ex.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+    ttk.Label(ex, text="Décalage à l'export (dB) :").grid(row=0, column=0)
+    ttk.Entry(ex, textvariable=var_off, width=6).grid(row=0, column=1, padx=(4, 0))
+    ttk.Checkbutton(act, text="Appliquer le lissage du fader à l'export", variable=var_liss_ex).grid(
+        row=4, column=0, columnspan=3, sticky="w", pady=(2, 0))
+
+    # ---- partie droite : afficheur large
+    droite = ttk.Frame(root, padding=(4, 8, 10, 8))
+    droite.grid(row=0, column=1, sticky="nsew")
+    droite.columnconfigure(0, weight=1)
+    droite.rowconfigure(0, weight=1)
+
+    graph_frame = ttk.Frame(droite)
+    graph_frame.grid(row=0, column=0, sticky="nsew")
+    graph_frame.columnconfigure(0, weight=1)
+    graph_frame.rowconfigure(0, weight=1)
+
+    graphe = None
+    toolbar = None
+    try:
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        fig = Figure(figsize=(11, 6), dpi=100)
+        ax = fig.add_subplot(111)
+        ax.set_xlabel("Fréquence (MHz)", fontsize=11)
+        ax.set_ylabel("Niveau (dBm)", fontsize=11)
+        ax.set_title("En attente d'un scan", fontsize=12)
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim(float(DEBUT_DEFAUT), float(FIN_DEFAUT))
+        ax.set_ylim(-120, -40)
+        canvas = FigureCanvasTkAgg(fig, master=graph_frame)
+        canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        try:
+            from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
+            tb_frame = ttk.Frame(graph_frame)
+            tb_frame.grid(row=1, column=0, sticky="we")
+            toolbar = NavigationToolbar2Tk(canvas, tb_frame, pack_toolbar=False)
+            toolbar.pack(side="left")
+            toolbar.update()
+        except Exception:
+            toolbar = None
+        ligne_live_raw, = ax.plot([], [], color="black", alpha=0.3, linewidth=0.7)
+        ligne_live, = ax.plot([], [], color="black", linewidth=1.8, label="Scan en cours")
+        ligne_now, = ax.plot([], [], color="tab:orange", alpha=0.6, linewidth=0.7)
+        ligne_seuil = ax.axhline(-100, color="red", linewidth=1.2, visible=False)
+        txt_seuil = ax.text(0.01, 0.0, "", transform=ax.get_yaxis_transform(), color="red",
+                            fontsize=9, va="bottom", visible=False)
+        deco = []        # repères TNT + marqueur de tranche (effacés et redessinés)
+        fig.subplots_adjust(left=0.07, right=0.985, top=0.93, bottom=0.09)
+        graphe = True
+    except Exception as err:
+        ttk.Label(graph_frame, text=f"Visualisation indisponible ({err}).\nInstalle matplotlib :  pip3 install matplotlib").grid()
+
+    ctrl = ttk.Frame(droite)
+    ctrl.grid(row=1, column=0, sticky="we", pady=(6, 0))
+    ctrl.columnconfigure(1, weight=1)
+    ttk.Label(ctrl, text="Lissage :", font=("Helvetica", 12, "bold")).grid(row=0, column=0, padx=(0, 8))
+    curseur = ttk.Scale(ctrl, from_=0, to=LISSAGE_K_MAX, orient="horizontal")
+    curseur.set(var_k.get())
+    curseur.grid(row=0, column=1, sticky="we")
+    ttk.Label(ctrl, textvariable=var_liss_txt, width=24).grid(row=0, column=2, padx=(8, 0))
+
+    opt = ttk.Frame(droite)
+    opt.grid(row=2, column=0, sticky="we", pady=(4, 0))
+    ttk.Checkbutton(opt, text="Courbe brute en pâle", variable=var_brut).grid(row=0, column=0, padx=(0, 12))
+    ttk.Checkbutton(opt, text="Canaux TNT", variable=var_tnt).grid(row=0, column=1, padx=(0, 4))
+    ttk.Label(opt, text="surligner :").grid(row=0, column=2)
+    ttk.Entry(opt, textvariable=var_canaux, width=14).grid(row=0, column=3, padx=(4, 12))
+    ttk.Label(opt, text="Seuil (dBm) :").grid(row=0, column=4)
+    ttk.Entry(opt, textvariable=var_seuil, width=6).grid(row=0, column=5, padx=(4, 12))
+    btn_vue = ttk.Button(opt, text="Vue complète")
+    btn_vue.grid(row=0, column=6, padx=(0, 12))
+    btn_img = ttk.Button(opt, text="Enregistrer l'image...")
+    btn_img.grid(row=0, column=7)
+
+    etat_l = ttk.Frame(droite)
+    etat_l.grid(row=3, column=0, sticky="we", pady=(6, 0))
+    etat_l.columnconfigure(1, weight=1)
+    ttk.Label(etat_l, textvariable=var_statut, width=44).grid(row=0, column=0, sticky="w")
+    prog = ttk.Progressbar(etat_l, mode="determinate", maximum=100)
+    prog.grid(row=0, column=1, sticky="we", padx=8)
+    ttk.Label(etat_l, textvariable=var_curseur, width=40).grid(row=0, column=2, sticky="e")
+
+    log = tk.Text(droite, height=5, state="disabled")
+    log.grid(row=4, column=0, sticky="we", pady=(6, 0))
+
+    # ---- utilitaires
+    def ecrire(texte):
+        log.config(state="normal")
+        log.insert("end", texte + "\n")
+        log.see("end")
+        log.config(state="disabled")
+
+    def maj_titre():
+        marque = " *" if sess["modifie"] and not sess["chemin"] else ""
+        nom = sess["s"]["nom"]
+        var_session.set(f"Session : {nom}{marque}")
+        root.title(f"tinySA -> WWB  -  {nom}{marque}")
+
+    def enregistrer_auto():
+        """Enregistre la session si elle a déjà un fichier. Sinon : rien (elle reste en mémoire)."""
+        sess["modifie"] = True
+        if sess["chemin"]:
+            try:
+                sauver_session(sess["s"], sess["chemin"])
+                sess["modifie"] = False
+            except Exception as e:
+                ecrire(f"ERREUR d'enregistrement de la session : {e}")
+        maj_titre()
+
+    def sauver_sous():
+        nom = sess["s"]["nom"]
+        init = (nom if nom != "Sans titre" else "Session") + EXTENSION
+        chemin = filedialog.asksaveasfilename(
+            title="Enregistrer la session",
+            defaultextension=EXTENSION,
+            initialfile=init,
+            initialdir=cfg.get("dossier", os.path.expanduser("~/Documents")),
+            filetypes=[("Session tinySA", "*" + EXTENSION)],
+        )
+        if not chemin:
+            return False
+        sess["chemin"] = chemin
+        sess["s"]["nom"] = os.path.splitext(os.path.basename(chemin))[0]
+        cfg["dossier"] = os.path.dirname(chemin)
+        cfg["session"] = chemin
+        try:
+            sauver_session(sess["s"], chemin)
+            sess["modifie"] = False
+            ecrire(f"Session enregistrée : {chemin}")
+        except Exception as e:
+            ecrire(f"ERREUR d'enregistrement : {e}")
+            return False
+        maj_titre()
+        return True
+
+    def demander_confirmation_perte():
+        if sess["s"]["scans"] and sess["modifie"] and not sess["chemin"]:
+            return messagebox.askyesno("Session non enregistrée",
+                                       "Cette session n'est pas enregistrée. La quitter quand même ?")
+        return True
+
+    def installer_session(s, chemin):
+        for ident in list(lignes):
+            for l in lignes.pop(ident):
+                l.remove()
+        cache.clear()
+        sess["s"] = s
+        sess["chemin"] = chemin
+        sess["modifie"] = False
+        sess["selection"] = s["scans"][-1]["id"] if s["scans"] else None
+        vue["auto"] = True
+        live["acc"].clear()
+        live["dirty"] = True
+        rebuild_liste()
+        maj_titre()
+
+    def nouvelle():
+        if not demander_confirmation_perte():
+            return
+        installer_session(nouvelle_session(), None)
+        ecrire("Nouvelle session.")
+
+    def ouvrir():
+        if not demander_confirmation_perte():
+            return
+        chemin = filedialog.askopenfilename(
+            title="Ouvrir une session",
+            initialdir=cfg.get("dossier", os.path.expanduser("~/Documents")),
+            filetypes=[("Session tinySA", "*" + EXTENSION), ("Tous les fichiers", "*.*")],
+        )
+        if not chemin:
+            return
+        try:
+            s = charger_session(chemin)
+        except Exception as e:
+            ecrire(f"Impossible d'ouvrir la session : {e}")
+            return
+        cfg["dossier"] = os.path.dirname(chemin)
+        cfg["session"] = chemin
+        installer_session(s, chemin)
+        ecrire(f"Session ouverte : {chemin}  ({len(s['scans'])} scan(s))")
+
+    # ---- liste des scans
+    def scan_selectionne():
+        for sc in sess["s"]["scans"]:
+            if sc["id"] == sess["selection"]:
+                return sc
+        return None
+
+    def selectionner(ident):
+        sess["selection"] = ident
+        rebuild_liste()
+
+    def basculer(sc, var):
+        sc["visible"] = var.get()
+        live["dirty"] = True
+        vue["auto"] = True
+        enregistrer_auto()
+
+    def choisir_couleur(sc):
+        res = colorchooser.askcolor(color=sc["couleur"], title=f"Couleur de « {sc['nom']} »")
+        if res and res[1]:
+            sc["couleur"] = res[1]
+            live["dirty"] = True
+            rebuild_liste()
+            enregistrer_auto()
+
+    def rebuild_liste():
+        for w in liste.winfo_children():
+            w.destroy()
+        if not sess["s"]["scans"]:
+            ttk.Label(liste, text="Aucun scan. Lance un scan ou importe un fichier.",
+                      foreground="gray").grid(row=0, column=0, padx=4, pady=8)
+        for i, sc in enumerate(sess["s"]["scans"]):
+            choisi = sc["id"] == sess["selection"]
+            fond = "#d7e6fb" if choisi else "#f2f2f2"
+            ligne = tk.Frame(liste, bg=fond, padx=3, pady=3)
+            ligne.grid(row=i, column=0, sticky="we", pady=1)
+            var = tk.BooleanVar(value=sc.get("visible", True))
+            ttk.Checkbutton(ligne, variable=var, command=lambda s=sc, v=var: basculer(s, v)).grid(
+                row=0, column=0, rowspan=2, padx=(0, 4))
+            sw = tk.Canvas(ligne, width=18, height=18, highlightthickness=0, bg=fond, cursor="hand2")
+            sw.create_rectangle(1, 1, 17, 17, fill=sc["couleur"], outline="gray")
+            sw.bind("<Button-1>", lambda e, s=sc: choisir_couleur(s))
+            sw.grid(row=0, column=1, rowspan=2, padx=(0, 6))
+            nom = tk.Label(ligne, text=sc["nom"], bg=fond, anchor="w", font=("Helvetica", 12, "bold"))
+            nom.grid(row=0, column=2, sticky="we")
+            det = tk.Label(ligne, text=decrire_scan(sc), bg=fond, anchor="w", justify="left",
+                           font=("Helvetica", 9), fg="#444444")
+            det.grid(row=1, column=2, sticky="we")
+            ligne.columnconfigure(2, weight=1)
+            for w in (ligne, nom, det):
+                w.bind("<Button-1>", lambda e, ident=sc["id"]: selectionner(ident))
+
+    def renommer():
+        sc = scan_selectionne()
+        if not sc:
+            ecrire("Sélectionne d'abord un scan (clic sur son nom).")
+            return
+        nouveau = simpledialog.askstring("Renommer le scan", "Nom du scan :", initialvalue=sc["nom"])
+        if nouveau and nouveau.strip():
+            sc["nom"] = nouveau.strip()
+            live["dirty"] = True
+            rebuild_liste()
+            enregistrer_auto()
+
+    def supprimer():
+        sc = scan_selectionne()
+        if not sc:
+            ecrire("Sélectionne d'abord un scan (clic sur son nom).")
+            return
+        if not messagebox.askyesno("Supprimer", f"Supprimer le scan « {sc['nom']} » de la session ?"):
+            return
+        sess["s"]["scans"].remove(sc)
+        sess["selection"] = sess["s"]["scans"][-1]["id"] if sess["s"]["scans"] else None
+        live["dirty"] = True
+        rebuild_liste()
+        enregistrer_auto()
+        ecrire(f"Scan « {sc['nom']} » supprimé.")
+
+    def importer():
+        chemin = filedialog.askopenfilename(
+            title="Importer un scan (Shure .sdb3, CSV MHz,dBm)",
+            initialdir=cfg.get("dossier", os.path.expanduser("~/Documents")),
+            filetypes=[("Scans", "*.sdb3 *.csv *.txt"), ("Tous les fichiers", "*.*")],
+        )
+        if not chemin:
+            return
+        try:
+            donnees = lire_shure(chemin)
+        except Exception as e:
+            ecrire(f"Import impossible : {e}")
+            return
+        nom = os.path.splitext(os.path.basename(chemin))[0]
+        source = "Shure" if chemin.lower().endswith(".sdb3") else "import"
+        sc = creer_scan(sess["s"], nom, donnees, resume=f"importé ({source})", source=source)
+        sess["selection"] = sc["id"]
+        vue["auto"] = True
+        live["dirty"] = True
+        rebuild_liste()
+        enregistrer_auto()
+        ecrire(f"Scan importé : {sc['nom']}  ({len(donnees)} points)")
+
+    def calibrer():
+        sc = scan_selectionne()
+        autres = [s for s in sess["s"]["scans"] if s.get("visible") and s is not sc]
+        if not sc or len(autres) != 1:
+            ecrire("Calibration : sélectionne le scan tinySA (clic sur son nom) et coche en plus UN SEUL "
+                   "scan de référence (le Shure), en décochant les autres.")
+            return
+        ref = autres[0]
+        try:
+            r = comparer(scan_donnees(sc), scan_donnees(ref))
+        except Exception as e:
+            ecrire(f"Calibration impossible : {e}")
+            return
+        ecrire(f"Calibration : « {ref['nom']} » (référence) contre « {sc['nom']} », "
+               f"{r['plage'][0]:g} à {r['plage'][1]:g} MHz, {r['n']} points communs.")
+        ecrire(f"  Plancher de bruit : référence {r['plancher_shure']:.1f} dBm, tinySA {r['plancher_tiny']:.1f} dBm "
+               "(il diffère toujours un peu : RBW et détecteur ne sont pas les mêmes).")
+        if r["off_signal"] is not None:
+            ecrire(f"  Écart sur les signaux ({r['n_signal']} pts) : {r['off_signal']:+.1f} dB   <- proposé")
+        ecrire(f"  Écart sur tout le scan : {r['off_tout']:+.1f} dB")
+        if r["off_signal"] is not None and abs(r["off_signal"] - r["off_tout"]) > 3:
+            ecrire("  Attention : ces deux écarts diffèrent de plus de 3 dB. Regarde les deux courbes superposées "
+                   "avant de te fier à un chiffre.")
+        ecrire("  Par sous-bande : " + " ; ".join(f"{a:g}-{b:g} : {d:+.1f}" for a, b, d in r["bandes"]))
+        ecrire("  Valable seulement si les deux scans ont été pris au même endroit, avec la même antenne.")
+        if messagebox.askyesno("Calibration",
+                               f"Écart mesuré : {r['offset']:+.1f} dB (référence - tinySA).\n"
+                               "Mettre cette valeur dans « Décalage à l'export » ?"):
+            var_off.set(f"{r['offset']:.1f}")
+            ecrire(f"Décalage à l'export réglé sur {r['offset']:+.1f} dB.")
+
+    def exporter():
+        sc = scan_selectionne()
+        if not sc:
+            ecrire("Sélectionne d'abord un scan dans la liste (clic sur son nom).")
+            return
+        try:
+            decalage = float(var_off.get().strip().replace(",", "."))
+        except ValueError:
+            ecrire("Décalage invalide : entre un nombre en dB (ex : 12 ou -3,5).")
+            return
+        chemin = filedialog.asksaveasfilename(
+            title="Exporter le CSV pour WWB",
+            defaultextension=".csv",
+            initialfile=nom_fichier(f"{sess['s']['nom']}_{sc['nom']}", "csv"),
+            initialdir=cfg.get("dossier_export", cfg.get("dossier", os.path.expanduser("~/Desktop"))),
+            filetypes=[("Fichier CSV", "*.csv")],
+        )
+        if not chemin:
+            return
+        donnees = scan_donnees(sc)
+        n = n_lissage(var_k.get())
+        lisse = var_liss_ex.get() and n > 1
+        if lisse:
+            donnees = lisser(donnees, n)
+        ecrire_csv({k: v + decalage for k, v in donnees.items()}, chemin)
+        cfg["dossier_export"] = os.path.dirname(chemin)
+        details = []
+        if lisse:
+            details.append(f"lissage {n} points")
+        if decalage:
+            details.append(f"décalage {decalage:+g} dB")
+        ecrire(f"CSV exporté : {chemin}  [{sc['nom']}]" + (f"  ({', '.join(details)})" if details else ""))
+
+    def enregistrer_image():
+        if not graphe:
+            return
+        chemin = filedialog.asksaveasfilename(
+            title="Enregistrer l'image de l'afficheur",
+            defaultextension=".png",
+            initialfile=nom_fichier(sess["s"]["nom"], "png"),
+            initialdir=cfg.get("dossier_export", cfg.get("dossier", os.path.expanduser("~/Desktop"))),
+            filetypes=[("Image PNG", "*.png")],
+        )
+        if chemin:
+            fig.savefig(chemin, dpi=150)
+            ecrire(f"Image enregistrée : {chemin}")
+
+    # ---- lancement des scans
+    def demarrer(viewer):
+        try:
+            tranches = generer_tranches(float(var_deb.get().replace(",", ".")),
+                                        float(var_fin.get().replace(",", ".")))
+        except ValueError:
+            ecrire("Vérifie la plage (ex : 470 à 670, fin > début).")
+            return
+        try:
+            passes = 0 if var_inf.get() else max(1, int(var_passes.get()))
+        except ValueError:
+            ecrire("Le nombre de passes doit être un entier (ou coche « jusqu'à l'arrêt »).")
+            return
+        rbw = var_rbw.get().strip().lower()
+        att = var_att.get().strip().lower()
+        try:
+            if rbw != "auto":
+                rbw = str(int(float(rbw)))
+                assert 3 <= int(rbw) <= 850
+            if att != "auto":
+                att = str(int(float(att)))
+                assert 0 <= int(att) <= 31
+        except (ValueError, AssertionError):
+            ecrire("Vérifie le RBW (auto ou 3 à 850) et l'atténuation (auto ou 0 à 31).")
+            return
+        p = {
+            "tranches": tranches, "passes": passes, "maxhold": var_max.get(),
+            "demo": var_demo.get(), "appliquer": var_appl.get(), "rbw": rbw, "att": att,
+            "lna": var_lna.get(), "viewer": viewer, "reset": reset,
+        }
+        sauver_reglages()
+        info = f"{len(tranches)} tranche(s) : {tranches[0][0]:g} à {tranches[-1][1]:g} MHz, pas 25 kHz"
+        if viewer:
+            info += ". Astuce : une plage courte (ex : 610 à 650) se rafraîchit plus vite."
+        else:
+            info += f", {passes} passe(s)" if passes else ", passes jusqu'à l'arrêt"
+        ecrire(info)
+        stop.clear()
+        reset.clear()
+        live["scan"] = True
+        live["acc"].clear()
+        live["courant"] = None
+        vue["auto"] = True
+        prog["value"] = 0
+        btn_go.config(state="disabled")
+        btn_view.config(state="disabled")
+        btn_stop.config(state="normal")
+        btn_reset.config(state="normal" if viewer else "disabled")
+        threading.Thread(target=travail, args=(p, lambda k, t: q.put((k, t)), stop), daemon=True).start()
+
+    def lancer():
+        demarrer(False)
+
+    def visualiser():
+        demarrer(True)
+
+    def effacer_cumul():
+        reset.set()
+        ecrire("Cumul effacé.")
+
+    def arreter():
+        stop.set()
+        ecrire("Arrêt demandé, la tranche en cours se termine (ce qui est mesuré est conservé)...")
+
+    def terminer_scan(res):
+        donnees = res["donnees"]
+        nom = var_nom.get().strip()
+        sc = creer_scan(sess["s"], nom, donnees, resume=res["resume"], passes=res["passes"],
+                        mode=res["mode"], source="tinySA", duree=res["duree"])
+        sess["selection"] = sc["id"]
+        live["acc"].clear()
+        live["scan"] = False
+        live["dirty"] = True
+        vue["auto"] = True
+        rebuild_liste()
+        if not sess["chemin"]:
+            ecrire("Scan terminé. Enregistre la session (nom du lieu) pour ne rien perdre...")
+            if not sauver_sous():
+                sess["modifie"] = True
+                maj_titre()
+        else:
+            enregistrer_auto()
+        top = pics(donnees, 5)
+        ecrire("Pics les plus forts (lissés) : " + " ; ".join(
+            f"{f:.2f} MHz {v:.1f} dBm" + (f" (canal {c})" if c else "") for f, v, c in top))
+
+    # ---- réglages mémorisés
+    def sauver_reglages():
+        cfg.update({
+            "deb": var_deb.get(), "fin": var_fin.get(), "passes": var_passes.get(), "inf": var_inf.get(),
+            "max": var_max.get(), "nom_scan": var_nom.get(), "appl": var_appl.get(), "rbw": var_rbw.get(),
+            "att": var_att.get(), "lna": var_lna.get(), "off": var_off.get(),
+            "liss_export": var_liss_ex.get(), "k": int(var_k.get()), "brut": var_brut.get(),
+            "tnt": var_tnt.get(), "canaux": var_canaux.get(),
+        })
+        sauver_config(cfg)
+
+    def fermer():
+        if sess["s"]["scans"] and sess["modifie"] and not sess["chemin"]:
+            if not messagebox.askyesno("Quitter", "La session n'est pas enregistrée. Quitter quand même ?"):
+                return
+        stop.set()
+        sauver_reglages()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", fermer)
+
+    # ---- curseur de lissage, seuil, curseur de souris
+    def maj_texte_lissage():
+        n = n_lissage(var_k.get())
+        var_liss_txt.set("aucun" if n == 1 else f"{n} points ({n * PAS_MHZ * 1000:g} kHz)")
+
+    def sur_curseur(valeur):
+        k = int(round(float(valeur)))
+        if k != var_k.get():
+            var_k.set(k)
+            maj_texte_lissage()
+            live["dirty"] = True
+
+    curseur.config(command=sur_curseur)
+    maj_texte_lissage()
+
+    def sur_seuil(*_):
+        txt = var_seuil.get().strip().replace(",", ".")
+        try:
+            seuil["y"] = float(txt) if txt else None
+        except ValueError:
+            seuil["y"] = None
+        if graphe:
+            maj_seuil()
+            canvas.draw_idle()
+
+    def maj_seuil():
+        if seuil["y"] is None:
+            ligne_seuil.set_visible(False)
+            txt_seuil.set_visible(False)
+            return
+        ligne_seuil.set_ydata([seuil["y"], seuil["y"]])
+        ligne_seuil.set_visible(True)
+        txt_seuil.set_position((0.01, seuil["y"]))
+        txt_seuil.set_text(f" seuil {seuil['y']:.1f} dBm")
+        txt_seuil.set_visible(True)
+
+    def zoom_actif():
+        mode = getattr(toolbar, "mode", "") if toolbar else ""
+        mode = getattr(mode, "value", mode)
+        return mode not in ("", None)
+
+    def sur_clic(ev):
+        if ev.inaxes is ax and seuil["y"] is not None and not zoom_actif() and ev.ydata is not None:
+            bas, haut = ax.get_ylim()
+            if abs(ev.ydata - seuil["y"]) < 0.02 * (haut - bas):
+                seuil["drag"] = True
+
+    def sur_mouvement(ev):
+        if ev.inaxes is not ax or ev.xdata is None:
+            var_curseur.set("")
+            return
+        if seuil["drag"]:
+            seuil["y"] = round(ev.ydata, 1)
+            var_seuil.set(f"{seuil['y']:.1f}")
+            maj_seuil()
+            canvas.draw_idle()
+        c = canal_de(ev.xdata)
+        var_curseur.set(f"{ev.xdata:.3f} MHz   {ev.ydata:.1f} dBm" + (f"   (canal {c})" if c else ""))
+
+    def sur_relache(ev):
+        seuil["drag"] = False
+
+    def sur_limites(_):
+        if not vue["interne"]:
+            vue["auto"] = False          # l'utilisateur a zoomé / déplacé la vue
+            live["dirty"] = True
+
+    def vue_complete():
+        vue["auto"] = True
+        live["dirty"] = True
+
+    def fixer_limites(x=None, y=None):
+        vue["interne"] = True
+        try:
+            if x:
+                ax.set_xlim(*x)
+            if y:
+                ax.set_ylim(*y)
+        finally:
+            vue["interne"] = False
+
+    if graphe:
+        canvas.mpl_connect("button_press_event", sur_clic)
+        canvas.mpl_connect("motion_notify_event", sur_mouvement)
+        canvas.mpl_connect("button_release_event", sur_relache)
+        ax.callbacks.connect("xlim_changed", sur_limites)
+        ax.callbacks.connect("ylim_changed", sur_limites)
+
+    for v in (var_brut, var_tnt, var_canaux):
+        v.trace_add("write", lambda *_: live.update(dirty=True))
+    var_seuil.trace_add("write", sur_seuil)
+
+    def maj_passes(*_):
+        ent_passes.config(state="disabled" if var_inf.get() else "normal")
+
+    var_inf.trace_add("write", maj_passes)
+    maj_passes()
+
+    btn_nouv.config(command=nouvelle)
+    btn_ouvrir.config(command=ouvrir)
+    btn_sauver.config(command=sauver_sous)
+    btn_go.config(command=lancer)
+    btn_view.config(command=visualiser)
+    btn_reset.config(command=effacer_cumul)
+    btn_stop.config(command=arreter)
+    btn_export.config(command=exporter)
+    btn_ren.config(command=renommer)
+    btn_sup.config(command=supprimer)
+    btn_imp.config(command=importer)
+    btn_cal.config(command=calibrer)
+    btn_vue.config(command=vue_complete)
+    btn_img.config(command=enregistrer_image)
+
+    # ---- file de messages du thread de scan
+    def surveiller():
+        try:
+            while True:
+                kind, texte = q.get_nowait()
+                if kind == "log":
+                    ecrire(texte)
+                elif kind == "result":
+                    terminer_scan(texte)
+                elif kind == "plan":
+                    live["plan"] = texte
+                    live["acc"].clear()
+                    live["now"] = ([], [])
+                    live["dirty"] = True
+                elif kind == "live":
+                    idx, f, now, acc, _passe = texte
+                    live["acc"][idx] = (f, acc)
+                    live["now"] = (f, now)
+                    if idx < len(live["plan"]):
+                        live["courant"] = live["plan"][idx]
+                    live["dirty"] = True
+                elif kind == "status":
+                    var_statut.set(texte)
+                    live["titre"] = texte
+                    live["dirty"] = True
+                elif kind == "progress":
+                    prog["value"] = 100 * texte
+                elif kind == "done":
+                    btn_go.config(state="normal")
+                    btn_view.config(state="normal")
+                    btn_stop.config(state="disabled")
+                    btn_reset.config(state="disabled")
+                    var_statut.set("Terminé.")
+                    prog["value"] = 0
+                    live["now"] = ([], [])
+                    live["courant"] = None
+                    live["scan"] = False
+                    live["dirty"] = True
+        except queue.Empty:
+            pass
+        root.after(100, surveiller)
+
+    # ---- dessin de l'afficheur
+    def courbe_scan(sc, n):
+        cle = (sc["id"], n)
+        if cle not in cache:
+            if len(cache) > 60:
+                cache.clear()
+            cache[cle] = courbe(sc["f"], sc["d"], n)
+        return cache[cle]
+
+    def rafraichir():
+        """Redessine l'afficheur (au plus 4 fois par seconde)."""
+        if graphe and live["dirty"]:
+            live["dirty"] = False
+            n = n_lissage(var_k.get())
+            tous_y = []
+            bornes_x = []
+            poignees = []
+            vus = set()
+            for sc in sess["s"]["scans"]:
+                vus.add(sc["id"])
+                l = lignes.get(sc["id"])
+                if l is None:
+                    brut, lis = ax.plot([], [], linewidth=0.7, alpha=0.3)[0], ax.plot([], [], linewidth=1.8)[0]
+                    l = lignes[sc["id"]] = (brut, lis)
+                brut, lis = l
+                visible = bool(sc.get("visible", True)) and bool(sc["f"])
+                brut.set_color(sc["couleur"])
+                lis.set_color(sc["couleur"])
+                brut.set_visible(visible and var_brut.get() and n > 1)
+                lis.set_visible(visible)
+                lis.set_label(sc["nom"])
+                if visible:
+                    xs, b, li = courbe_scan(sc, n)
+                    brut.set_data(xs, b)
+                    lis.set_data(xs, li)
+                    tous_y += [y for y in li if y == y] + [y for y in b if y == y]
+                    bornes_x += [sc["f"][0], sc["f"][-1]]
+                    poignees.append(lis)
+            for ident in list(lignes):
+                if ident not in vus:
+                    for l in lignes.pop(ident):
+                        l.remove()
+
+            # scan en cours (même lissage que le reste)
+            if live["acc"]:
+                fs, vs = [], []
+                for idx in sorted(live["acc"]):
+                    f, a = live["acc"][idx]
+                    fs += f
+                    vs += a
+                xs, b, li = courbe(fs, vs, n)
+                ligne_live_raw.set_data(xs, b)
+                ligne_live.set_data(xs, li)
+                ligne_live_raw.set_visible(var_brut.get() and n > 1)
+                ligne_live.set_visible(True)
+                tous_y += [y for y in li if y == y] + [y for y in b if y == y]
+                bornes_x += [fs[0], fs[-1]]
+                poignees.append(ligne_live)
+            else:
+                ligne_live_raw.set_visible(False)
+                ligne_live.set_visible(False)
+            if live["now"][0]:
+                ligne_now.set_data(*live["now"])
+                ligne_now.set_visible(True)
+                tous_y += list(live["now"][1])
+            else:
+                ligne_now.set_visible(False)
+
+            if live["plan"] and (live["scan"] or not bornes_x):
+                bornes_x += [live["plan"][0][0], live["plan"][-1][1]]
+
+            # limites (sauf si l'utilisateur a zoomé)
+            if vue["auto"]:
+                if bornes_x:
+                    fixer_limites(x=(min(bornes_x), max(bornes_x)))
+                if tous_y:
+                    fixer_limites(y=(math.floor((min(tous_y) - 3) / 5) * 5, math.ceil((max(tous_y) + 3) / 5) * 5))
+
+            # repères : canaux TNT, tranche en cours
+            for a in deco:
+                try:
+                    a.remove()
+                except Exception:
+                    pass
+            deco.clear()
+            xmin, xmax = ax.get_xlim()
+            deco.extend(dessiner_canaux(ax, xmin, xmax, lire_canaux(var_canaux.get()), var_tnt.get()))
+            if live["scan"] and live["courant"]:
+                a, b = live["courant"]
+                deco.append(ax.axvspan(a, b, color="gold", alpha=0.18, linewidth=0))
+            maj_seuil()
+
+            ax.set_title(live.get("titre", "") if live["scan"] else
+                         (f"{sess['s']['nom']}" + (f"  -  {len(poignees)} scan(s) affiché(s)" if poignees else "")),
+                         fontsize=12)
+            if poignees:
+                ax.legend(handles=poignees, loc="upper right", fontsize=9)
+            elif ax.get_legend():
+                ax.get_legend().remove()
+            canvas.draw_idle()
+        root.after(250, rafraichir)
+
+    # ---- démarrage
+    chemin_prec = cfg.get("session")
+    if chemin_prec and os.path.exists(chemin_prec):
+        try:
+            installer_session(charger_session(chemin_prec), chemin_prec)
+            ecrire(f"Session rouverte : {chemin_prec}  ({len(sess['s']['scans'])} scan(s))")
+        except Exception as e:
+            ecrire(f"Dernière session non rouverte : {e}")
+    rebuild_liste()
+    maj_titre()
+    sur_seuil()
+    rafraichir()
+    surveiller()
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,40 @@
+name: Fabriquer l'application Mac (M1)
+
+on:
+  workflow_dispatch:        # bouton "Run workflow" dans l'onglet Actions
+  push:
+    tags: ["v*"]            # ou : créer une étiquette v1, v2...
+
+jobs:
+  build:
+    runs-on: macos-14       # Mac Apple Silicon (M1)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installer les dépendances
+        run: python -m pip install --upgrade pip pyinstaller -r requirements.txt
+
+      - name: Vérifier Tkinter
+        run: python -c "import tkinter; print('Tk', tkinter.TkVersion)"
+
+      - name: Fabriquer l'application
+        run: |
+          pyinstaller --windowed --noconfirm --name "tinySA WWB" \
+            --hidden-import serial \
+            --hidden-import matplotlib.backends.backend_tkagg \
+            tinysa_wwb.py
+
+      - name: Signature locale (ad hoc)
+        run: codesign --force --deep --sign - "dist/tinySA WWB.app"
+
+      - name: Compresser
+        run: ditto -c -k --keepParent "dist/tinySA WWB.app" tinySA-WWB-mac-M1.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tinySA-WWB-mac-M1
+          path: tinySA-WWB-mac-M1.zip
