@@ -787,7 +787,7 @@ def main():
     sd = ttk.LabelFrame(corps, text="Scan data", padding=6)
     sd.grid(row=0, column=0, sticky="ns", padx=(10, 4), pady=4)
     sd.rowconfigure(0, weight=1)
-    zone = tk.Canvas(sd, width=300, height=300, highlightthickness=0)
+    zone = tk.Canvas(sd, width=350, height=300, highlightthickness=0)
     zone.grid(row=0, column=0, sticky="nsew")
     asc = ttk.Scrollbar(sd, orient="vertical", command=zone.yview)
     asc.grid(row=0, column=1, sticky="ns")
@@ -1072,10 +1072,10 @@ def main():
             sw.create_rectangle(1, 1, 17, 17, fill=sc["couleur"], outline="gray")
             sw.bind("<Button-1>", lambda e, s=sc: choisir_couleur(s))
             sw.grid(row=0, column=1, rowspan=2, padx=(0, 6))
-            nom = tk.Label(ligne, text=sc["nom"], bg=fond, anchor="w", font=("Helvetica", 12, "bold"))
+            nom = tk.Label(ligne, text=sc["nom"], bg=fond, anchor="w", font=("Helvetica", 12, "bold"), wraplength=215)
             nom.grid(row=0, column=2, sticky="we")
             det = tk.Label(ligne, text=decrire_scan(sc), bg=fond, anchor="w", justify="left",
-                           font=("Helvetica", 9), fg="#444444")
+                           font=("Helvetica", 9), fg="#444444", wraplength=215)
             det.grid(row=1, column=2, sticky="we")
             etiquettes[sc["id"]] = det
             var_ref = tk.BooleanVar(value=sess["s"].get("ref") == sc["id"])
