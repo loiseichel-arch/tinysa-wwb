@@ -90,13 +90,21 @@ def balayer(ser, debut_mhz, fin_mhz, demo):
     if demo:
         time.sleep(0.2)
         return balayage_demo(debut_mhz, fin_mhz)
-    for essai in range(3):               # un balayage perdu ne doit pas faire échouer tout le scan
+    meilleur = ([], [])
+    for essai in range(3):               # un balayage perdu ou incomplet ne doit pas faire échouer tout le scan
         try:
-            return un_balayage(ser, debut_mhz, fin_mhz)
+            f, d = un_balayage(ser, debut_mhz, fin_mhz)
         except TimeoutError:
-            if essai == 2:
+            if essai == 2 and not meilleur[0]:
                 raise
             time.sleep(0.5)
+            continue
+        if len(f) > len(meilleur[0]):
+            meilleur = (f, d)
+        if len(f) == POINTS:             # réponse complète : 450 lignes (le port USB en perd parfois une)
+            return f, d
+        time.sleep(0.2)
+    return meilleur
 
 
 # ---------- Logique de scan ----------
@@ -474,6 +482,8 @@ def courbe(freqs, vals, n):
     nan = float("nan")
     xs, brut, lis = [], [], []
     debut = 0
+    m = min(len(freqs), len(vals))       # sécurité : jamais de tableaux de longueurs différentes
+    freqs, vals = list(freqs)[:m], list(vals)[:m]
     for i in range(1, len(freqs) + 1):
         if i == len(freqs) or freqs[i] - freqs[i - 1] > PAS_MHZ * 1.5:
             f, v = freqs[debut:i], vals[debut:i]
