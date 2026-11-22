@@ -386,7 +386,7 @@ def ecrire_csv(donnees, chemin):
 # couleurs vives, lisibles sur fond noir
 PALETTE = ["#4da3ff", "#ffb347", "#6ee06e", "#ff6b6b", "#c792ea", "#ffd54f", "#4dd0e1", "#f48fb1"]
 LISSAGE_K_MAX = 20           # curseur de lissage : k de 0 à 20  ->  1 + 2k points (1 à 41)
-LISSAGE_K_DEFAUT = 11        # 23 points (575 kHz)
+LISSAGE_K_DEFAUT = 13        # 27 points (675 kHz)
 EXTENSION = ".tinysa"
 
 
@@ -655,10 +655,10 @@ def main():
         sys.exit("Tkinter indisponible. Installe Python depuis python.org (Tkinter inclus).")
 
     cfg = charger_config()
-    if cfg.get("v") != 6:                       # anciens réglages d'affichage : on repart des nouveaux défauts
+    if cfg.get("v") != 7:                       # anciens réglages d'affichage : on repart des nouveaux défauts
         for cle in ("k", "brut", "off"):
             cfg.pop(cle, None)
-        cfg["v"] = 6
+        cfg["v"] = 7
 
     def c_str(cle, defaut):
         return str(cfg.get(cle, defaut))
@@ -767,7 +767,6 @@ def main():
     ttk.Label(lc, text="Atténuation (dB)").grid(row=0, column=3, padx=(8, 2))
     ttk.Combobox(lc, textvariable=var_att, values=["auto", "0", "10", "20", "30"], width=6).grid(row=0, column=4)
     ttk.Checkbutton(lc, text="LNA (désactive l'atténuation)", variable=var_lna).grid(row=0, column=5, padx=(10, 0))
-    ttk.Checkbutton(lc, text="Mode démo (sans appareil)", variable=var_demo).grid(row=0, column=6, padx=(16, 0))
 
     # ---- corps : Scan data à gauche, graphique pleine largeur à droite
     corps = ttk.Frame(root)
@@ -1380,7 +1379,7 @@ def main():
     # ---- réglages mémorisés
     def sauver_reglages():
         cfg.update({
-            "v": 6, "deb": var_deb.get(), "fin": var_fin.get(), "passes": var_passes.get(), "inf": var_inf.get(),
+            "v": 7, "deb": var_deb.get(), "fin": var_fin.get(), "passes": var_passes.get(), "inf": var_inf.get(),
             "max": var_max.get(), "nom_scan": var_nom.get(), "appl": var_appl.get(), "rbw": var_rbw.get(),
             "att": var_att.get(), "lna": var_lna.get(), "liss_export": var_liss_ex.get(),
             "k": int(var_k.get()), "brut": var_brut.get(), "tnt": var_tnt.get(), "canaux": var_canaux.get(),
