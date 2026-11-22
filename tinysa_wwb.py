@@ -890,7 +890,9 @@ def main():
     btn_vue.grid(row=0, column=8, padx=(0, 12))
     btn_img = ttk.Button(opt, text="Enregistrer l'image...")
     btn_img.grid(row=0, column=9, padx=(0, 12))
-    ttk.Label(opt, textvariable=var_curseur, width=44).grid(row=0, column=10, sticky="e")
+    btn_debug = ttk.Button(opt, text="Debug")
+    btn_debug.grid(row=0, column=10, padx=(0, 12))
+    ttk.Label(opt, textvariable=var_curseur, width=44).grid(row=0, column=11, sticky="e")
 
     log = tk.Text(bas, height=3, state="disabled")
     log.grid(row=2, column=0, columnspan=3, sticky="we", pady=(6, 0))
@@ -1584,6 +1586,17 @@ def main():
         try:
             while True:
                 kind, texte = q.get_nowait()
+                try:
+                    traiter(kind, texte)
+                except Exception:
+                    noter_erreur(f"message « {kind} »")
+        except queue.Empty:
+            pass
+        root.after(100, surveiller)
+
+    def traiter(kind, texte):
+        if True:
+            if True:
                 if kind == "log":
                     ecrire(texte)
                 elif kind == "result":
@@ -1617,9 +1630,6 @@ def main():
                     live["courant"] = None
                     live["scan"] = False
                     live["dirty"] = True
-        except queue.Empty:
-            pass
-        root.after(100, surveiller)
 
     # ---- dessin de l'afficheur
     def courbe_scan(sc, n):
@@ -1631,8 +1641,80 @@ def main():
             cache[cle] = courbe(f, d, n)
         return cache[cle]
 
+    erreurs = []          # historique des erreurs d'affichage (pour le bouton Debug)
+    deja = set()
+
+    def noter_erreur(lieu):
+        import traceback
+        trace = traceback.format_exc()
+        erreurs.append(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {lieu}\n{trace}")
+        del erreurs[:-30]
+        cle = trace.strip().splitlines()[-1]
+        if cle not in deja:
+            deja.add(cle)
+            ecrire(f"ERREUR d'affichage ({lieu}) : {cle}  -> bouton Debug pour le détail. L'affichage continue.")
+
+    def rapport_debug():
+        import platform
+        L = [f"tinySA -> WWB : rapport de debug  {datetime.datetime.now().isoformat(timespec='seconds')}",
+             f"Python {platform.python_version()}  {platform.platform()}"]
+        try:
+            import matplotlib
+            L.append(f"matplotlib {matplotlib.__version__}  numpy {np.__version__}")
+        except Exception:
+            pass
+        L.append(f"Session : {sess['s']['nom']}  modifiée={sess['modifie']}  fichier={sess['chemin']}")
+        L.append(f"Scan en cours : {live['scan']}  tranches dans le plan : {len(live['plan'])}  "
+                 f"tranches reçues : {len(live['acc'])}  dessin en attente : {live['dirty']}")
+        L.append(f"Lissage : {n_lissage(var_k.get())} points  brut={var_brut.get()}  vue auto={vue['auto']}")
+        if graphe:
+            L.append(f"Axes : x={tuple(round(v, 3) for v in ax.get_xlim())}  y={tuple(round(v, 1) for v in ax.get_ylim())}")
+        for sc in sess["s"]["scans"]:
+            d = np.asarray(sc["d"], dtype=float)
+            bad = int((~np.isfinite(d)).sum()) if d.size else 0
+            L.append(f"  - {sc['nom']} : {len(sc['f'])} pts, visible={sc.get('visible', True)}, gain={sc.get('gain', 0)}, "
+                     f"corr={'oui' if sc.get('corr_f') else 'non'}, valeurs invalides={bad}"
+                     + (f", min/max={np.nanmin(d):.1f}/{np.nanmax(d):.1f}" if d.size and bad < d.size else ""))
+        L.append("")
+        L.append(f"Erreurs d'affichage enregistrées : {len(erreurs)}")
+        L += erreurs[-10:] or ["(aucune)"]
+        L.append("")
+        L.append("Journal de l'appli :")
+        L.append(log.get("1.0", "end") if hasattr(log, "get") else "")
+        return "\n".join(L)
+
+    def ouvrir_debug():
+        texte = rapport_debug()
+        fen = tk.Toplevel(root)
+        fen.title("Debug")
+        zone_t = tk.Text(fen, width=110, height=32)
+        zone_t.pack(fill="both", expand=True)
+        zone_t.insert("1.0", texte)
+
+        def enreg():
+            chemin = filedialog.asksaveasfilename(
+                title="Enregistrer le rapport", defaultextension=".txt",
+                initialfile=nom_fichier("debug_tinysa", "txt"),
+                initialdir=cfg.get("dossier_export", os.path.expanduser("~/Desktop")),
+                filetypes=[("Texte", "*.txt")])
+            if chemin:
+                with open(chemin, "w", encoding="utf-8") as f:
+                    f.write(texte)
+                ecrire(f"Rapport enregistré : {chemin}")
+        ttk.Button(fen, text="Enregistrer le rapport...", command=enreg).pack(pady=6)
+
+    btn_debug.config(command=ouvrir_debug)
+
     def rafraichir():
-        """Redessine l'afficheur (au plus 4 fois par seconde)."""
+        """Redessine l'afficheur (au plus 4 fois par seconde). Une erreur ne l'arrête jamais."""
+        try:
+            dessiner()
+        except Exception:
+            noter_erreur("dessin du graphe")
+            live["dirty"] = True
+        root.after(250, rafraichir)
+
+    def dessiner():
         if graphe and live["dirty"]:
             live["dirty"] = False
             n = n_lissage(var_k.get())
@@ -1731,7 +1813,6 @@ def main():
             elif ax.get_legend():
                 ax.get_legend().remove()
             canvas.draw_idle()
-        root.after(250, rafraichir)
 
     # ---- démarrage
     chemin_prec = cfg.get("session")
